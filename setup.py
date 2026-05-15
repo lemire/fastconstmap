@@ -1,6 +1,5 @@
 """Build configuration for the fastconstmap C extension."""
 import platform
-import sys
 
 from setuptools import Extension, setup
 
@@ -8,13 +7,13 @@ extra_compile_args = ["-O3"]
 extra_link_args = []
 
 if platform.system() != "Windows":
-    extra_compile_args += ["-std=c11", "-fvisibility=hidden"]
+    extra_compile_args += ["-std=c11"]
     # Math library for log/floor/round.
     extra_link_args += ["-lm"]
-    if sys.platform != "darwin":
-        # On Linux we want native CPU features for xxhash; macOS uses universal2
-        # builds for arm64+x86_64 so we leave -march to the compiler default.
-        extra_compile_args += ["-fPIC"]
+    # NB: do NOT pass -fvisibility=hidden. On Python 3.8 the PyMODINIT_FUNC
+    # macro does not carry a visibility("default") attribute, so hidden
+    # visibility would strip the PyInit__fastconstmap export and make the
+    # extension unimportable.
 else:
     extra_compile_args += ["/O2"]
 
