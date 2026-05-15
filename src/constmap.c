@@ -563,15 +563,17 @@ uint64_t fcm_verified_constmap_lookup(const fcm_verified_constmap_t *vm,
 /*   [4] segment_length                                                      */
 /*   [4] segment_count                                                       */
 /*   [4] data_len                                                            */
+/*   [4] reserved (zero) — pads the header to 32 bytes so the data array      */
+/*       starts 8-byte aligned, enabling zero-copy uint64 views               */
 /*   [8 * data_len] data                                                     */
 /*   (verified only) [8 * data_len] checks                                   */
 /*   [8] FNV-1a-64 checksum of all preceding bytes                           */
 /* ------------------------------------------------------------------------- */
 
-static const uint8_t fcm_magic_constmap[8]          = {'C','M','A','P','0','0','0','1'};
-static const uint8_t fcm_magic_verified_constmap[8] = {'V','C','M','P','0','0','0','1'};
+static const uint8_t fcm_magic_constmap[8]          = {'C','M','A','P','0','0','0','2'};
+static const uint8_t fcm_magic_verified_constmap[8] = {'V','C','M','P','0','0','0','2'};
 
-#define FCM_HEADER_SIZE 28u  /* 8 + 8 + 4 + 4 + 4 */
+#define FCM_HEADER_SIZE 32u  /* 8 magic + 8 seed + 4 seglen + 4 segcount + 4 datalen + 4 pad */
 #define FCM_TRAILER_SIZE 8u  /* checksum */
 
 static inline void fcm_write_u32(uint8_t *p, uint32_t v) {
@@ -629,6 +631,7 @@ int fcm_constmap_write(const fcm_constmap_t *cm, void *buf) {
     fcm_write_u32(p, cm->segment_length); p += 4;
     fcm_write_u32(p, cm->segment_count);  p += 4;
     fcm_write_u32(p, cm->data_len);       p += 4;
+    fcm_write_u32(p, 0);                  p += 4;  /* reserved padding */
     for (uint32_t i = 0; i < cm->data_len; i++) {
         fcm_write_u64(p, cm->data[i]); p += 8;
     }
@@ -688,6 +691,7 @@ int fcm_verified_constmap_write(const fcm_verified_constmap_t *vm, void *buf) {
     fcm_write_u32(p, vm->segment_length); p += 4;
     fcm_write_u32(p, vm->segment_count);  p += 4;
     fcm_write_u32(p, vm->data_len);       p += 4;
+    fcm_write_u32(p, 0);                  p += 4;  /* reserved padding */
     for (uint32_t i = 0; i < vm->data_len; i++) {
         fcm_write_u64(p, vm->data[i]); p += 8;
     }
@@ -742,5 +746,80 @@ int fcm_verified_constmap_read(fcm_verified_constmap_t *out, const void *buf, si
     out->data_len             = data_len;
     out->data                 = data;
     out->checks               = checks;
+    return FCM_OK;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Zero-copy views                                                           */
+/* ------------------------------------------------------------------------- */
+
+static inline int fcm_host_is_little_endian(void) {
+    const uint16_t x = 1;
+    return *(const uint8_t *)&x == 1;
+}
+
+int fcm_constmap_view(fcm_constmap_t *out, const void *buf, size_t buf_len) {
+    if (!out) return FCM_E_INVALID_FORMAT;
+    memset(out, 0, sizeof(*out));
+    if (!fcm_host_is_little_endian()) return FCM_E_INVALID_FORMAT;
+    if (buf_len < FCM_HEADER_SIZE + FCM_TRAILER_SIZE) return FCM_E_SHORT_BUFFER;
+
+    const uint8_t *p = (const uint8_t *)buf;
+    if (memcmp(p, fcm_magic_constmap, 8) != 0) return FCM_E_INVALID_FORMAT;
+
+    uint32_t data_len = fcm_read_u32(p + 24);
+    size_t expected = FCM_HEADER_SIZE + (size_t)data_len * 8u + FCM_TRAILER_SIZE;
+    if (buf_len < expected) return FCM_E_SHORT_BUFFER;
+
+    uint64_t got_sum      = fcm_read_u64(p + expected - 8);
+    uint64_t expected_sum = fcm_fnv1a64(p, expected - 8);
+    if (got_sum != expected_sum) return FCM_E_CHECKSUM;
+
+    const uint8_t *dp = p + FCM_HEADER_SIZE;
+    if (((uintptr_t)dp & 7u) != 0) return FCM_E_UNALIGNED;
+
+    uint32_t segment_length   = fcm_read_u32(p + 16);
+    out->seed                 = fcm_read_u64(p + 8);
+    out->segment_length       = segment_length;
+    out->segment_length_mask  = segment_length ? segment_length - 1 : 0;
+    out->segment_count        = fcm_read_u32(p + 20);
+    out->segment_count_length = out->segment_count * segment_length;
+    out->data_len             = data_len;
+    /* Borrowed pointer into `buf`; the integer round-trip launders away the
+     * source const-ness. Lookups only read this array. */
+    out->data = (uint64_t *)(uintptr_t)dp;
+    return FCM_OK;
+}
+
+int fcm_verified_constmap_view(fcm_verified_constmap_t *out, const void *buf, size_t buf_len) {
+    if (!out) return FCM_E_INVALID_FORMAT;
+    memset(out, 0, sizeof(*out));
+    if (!fcm_host_is_little_endian()) return FCM_E_INVALID_FORMAT;
+    if (buf_len < FCM_HEADER_SIZE + FCM_TRAILER_SIZE) return FCM_E_SHORT_BUFFER;
+
+    const uint8_t *p = (const uint8_t *)buf;
+    if (memcmp(p, fcm_magic_verified_constmap, 8) != 0) return FCM_E_INVALID_FORMAT;
+
+    uint32_t data_len = fcm_read_u32(p + 24);
+    size_t expected = FCM_HEADER_SIZE + (size_t)data_len * 16u + FCM_TRAILER_SIZE;
+    if (buf_len < expected) return FCM_E_SHORT_BUFFER;
+
+    uint64_t got_sum      = fcm_read_u64(p + expected - 8);
+    uint64_t expected_sum = fcm_fnv1a64(p, expected - 8);
+    if (got_sum != expected_sum) return FCM_E_CHECKSUM;
+
+    const uint8_t *dp = p + FCM_HEADER_SIZE;
+    const uint8_t *cp = dp + (size_t)data_len * 8u;
+    if (((uintptr_t)dp & 7u) != 0) return FCM_E_UNALIGNED;
+
+    uint32_t segment_length   = fcm_read_u32(p + 16);
+    out->seed                 = fcm_read_u64(p + 8);
+    out->segment_length       = segment_length;
+    out->segment_length_mask  = segment_length ? segment_length - 1 : 0;
+    out->segment_count        = fcm_read_u32(p + 20);
+    out->segment_count_length = out->segment_count * segment_length;
+    out->data_len             = data_len;
+    out->data   = (uint64_t *)(uintptr_t)dp;
+    out->checks = (uint64_t *)(uintptr_t)cp;
     return FCM_OK;
 }

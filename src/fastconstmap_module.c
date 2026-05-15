@@ -153,7 +153,21 @@ fail:
 typedef struct {
     PyObject_HEAD
     fcm_constmap_t cm;
+    /* When `view.obj` is non-NULL the map is a zero-copy view: `cm.data`
+     * points into `view`'s buffer and must NOT be freed. */
+    Py_buffer view;
 } PyConstMap;
+
+/* Release whatever storage the map currently holds (owned heap data or a
+ * borrowed buffer). Safe to call on a zero-initialised struct. */
+static void pyconstmap_release(PyConstMap *self) {
+    if (self->view.obj != NULL) {
+        /* Borrowed: data lives inside the buffer; just drop our reference. */
+        PyBuffer_Release(&self->view);   /* sets view.obj = NULL */
+        self->cm.data = NULL;
+    }
+    fcm_constmap_free(&self->cm);        /* frees owned data; no-op if NULL */
+}
 
 static int PyConstMap_init(PyConstMap *self, PyObject *args, PyObject *kwargs) {
     PyObject *dict;
@@ -166,7 +180,7 @@ static int PyConstMap_init(PyConstMap *self, PyObject *args, PyObject *kwargs) {
     PyObject  *keep = NULL;
     if (fcm_dict_to_arrays(dict, &n, &keys, &vals, &keep) < 0) return -1;
 
-    fcm_constmap_free(&self->cm);
+    pyconstmap_release(self);
 
     int rc;
     Py_BEGIN_ALLOW_THREADS
@@ -182,7 +196,7 @@ static int PyConstMap_init(PyConstMap *self, PyObject *args, PyObject *kwargs) {
 }
 
 static void PyConstMap_dealloc(PyConstMap *self) {
-    fcm_constmap_free(&self->cm);
+    pyconstmap_release(self);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -363,20 +377,74 @@ static PyObject *PyConstMap_data_bytes(PyConstMap *self, PyObject *Py_UNUSED(ign
     return PyLong_FromUnsignedLongLong((unsigned long long)self->cm.data_len * 8ULL);
 }
 
+static PyObject *PyConstMap_serialized_size(PyConstMap *self, PyObject *Py_UNUSED(ignored)) {
+    return PyLong_FromSize_t(fcm_constmap_serialized_size(&self->cm));
+}
+
+/* Serialize directly into a caller-provided writable buffer (e.g. a
+ * SharedMemory block), avoiding the intermediate bytes object. */
+static PyObject *PyConstMap_write_into(PyConstMap *self, PyObject *arg) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(arg, &view, PyBUF_WRITABLE) < 0) return NULL;
+    size_t need = fcm_constmap_serialized_size(&self->cm);
+    if (view.len < 0 || (size_t)view.len < need) {
+        PyErr_Format(PyExc_ValueError,
+                     "buffer too small: need %zu bytes, got %zd",
+                     need, view.len);
+        PyBuffer_Release(&view);
+        return NULL;
+    }
+    fcm_constmap_write(&self->cm, view.buf);
+    PyBuffer_Release(&view);
+    return PyLong_FromSize_t(need);
+}
+
+/* Zero-copy: build a map that reads directly out of `buffer`. The buffer
+ * is kept alive by the returned object; lookups touch it directly. */
+static PyObject *PyConstMap_from_buffer(PyTypeObject *type, PyObject *arg) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(arg, &view, PyBUF_SIMPLE) < 0) return NULL;
+    PyConstMap *self = (PyConstMap *)type->tp_alloc(type, 0);
+    if (!self) { PyBuffer_Release(&view); return NULL; }
+    /* tp_alloc zeroed the struct, so self->view.obj == NULL and cm is clear. */
+    int rc = fcm_constmap_view(&self->cm, view.buf, (size_t)view.len);
+    if (rc != FCM_OK) {
+        PyBuffer_Release(&view);
+        Py_DECREF(self);
+        if (rc == FCM_E_UNALIGNED) {
+            PyErr_SetString(PyExc_ValueError,
+                "buffer is not 8-byte aligned; cannot create a zero-copy view "
+                "(use from_bytes() to copy instead)");
+        } else {
+            fcm_set_python_error(rc);
+        }
+        return NULL;
+    }
+    self->view = view;  /* keep the buffer alive for the map's lifetime */
+    return (PyObject *)self;
+}
+
 static PyMethodDef PyConstMap_methods[] = {
-    {"get",         (PyCFunction)PyConstMap_get,         METH_O,
+    {"get",             (PyCFunction)PyConstMap_get,             METH_O,
      "Return the value for `key`. If `key` was not in the original mapping, the return value is undefined."},
-    {"get_many",    (PyCFunction)PyConstMap_get_many,    METH_O,
+    {"get_many",        (PyCFunction)PyConstMap_get_many,        METH_O,
      "Look up an iterable of keys. Returns a list of ints in the same order."},
-    {"to_bytes",    (PyCFunction)PyConstMap_serialize,   METH_NOARGS,
+    {"to_bytes",        (PyCFunction)PyConstMap_serialize,       METH_NOARGS,
      "Serialize the map to bytes."},
-    {"from_bytes",  (PyCFunction)PyConstMap_deserialize, METH_O   | METH_CLASS,
-     "Deserialize a map from a bytes-like object."},
-    {"save",        (PyCFunction)PyConstMap_save,        METH_O,
+    {"from_bytes",      (PyCFunction)PyConstMap_deserialize,     METH_O   | METH_CLASS,
+     "Deserialize a map from a bytes-like object (copies the data)."},
+    {"serialized_size", (PyCFunction)PyConstMap_serialized_size, METH_NOARGS,
+     "Number of bytes that to_bytes()/write_into() will produce."},
+    {"write_into",      (PyCFunction)PyConstMap_write_into,      METH_O,
+     "Serialize directly into a writable buffer (e.g. SharedMemory.buf). Returns bytes written."},
+    {"from_buffer",     (PyCFunction)PyConstMap_from_buffer,     METH_O   | METH_CLASS,
+     "Create a zero-copy map that reads directly from a buffer (e.g. shared memory). "
+     "The buffer is kept alive by the returned map and must not be modified while in use."},
+    {"save",            (PyCFunction)PyConstMap_save,            METH_O,
      "Save the map to a file path."},
-    {"load",        (PyCFunction)PyConstMap_load,        METH_O   | METH_CLASS,
+    {"load",            (PyCFunction)PyConstMap_load,            METH_O   | METH_CLASS,
      "Load a map from a file path."},
-    {"nbytes",      (PyCFunction)PyConstMap_data_bytes,  METH_NOARGS,
+    {"nbytes",          (PyCFunction)PyConstMap_data_bytes,      METH_NOARGS,
      "Heap size of the lookup array in bytes."},
     {NULL, NULL, 0, NULL}
 };
@@ -407,7 +475,18 @@ static PyTypeObject PyConstMapType = {
 typedef struct {
     PyObject_HEAD
     fcm_verified_constmap_t vm;
+    /* Non-NULL view.obj => zero-copy view: data/checks point into the buffer. */
+    Py_buffer view;
 } PyVerifiedConstMap;
+
+static void pyverified_release(PyVerifiedConstMap *self) {
+    if (self->view.obj != NULL) {
+        PyBuffer_Release(&self->view);
+        self->vm.data   = NULL;
+        self->vm.checks = NULL;
+    }
+    fcm_verified_constmap_free(&self->vm);
+}
 
 static int PyVerifiedConstMap_init(PyVerifiedConstMap *self, PyObject *args, PyObject *kwargs) {
     PyObject *dict;
@@ -420,7 +499,7 @@ static int PyVerifiedConstMap_init(PyVerifiedConstMap *self, PyObject *args, PyO
     PyObject  *keep = NULL;
     if (fcm_dict_to_arrays(dict, &n, &keys, &vals, &keep) < 0) return -1;
 
-    fcm_verified_constmap_free(&self->vm);
+    pyverified_release(self);
 
     int rc;
     Py_BEGIN_ALLOW_THREADS
@@ -436,7 +515,7 @@ static int PyVerifiedConstMap_init(PyVerifiedConstMap *self, PyObject *args, PyO
 }
 
 static void PyVerifiedConstMap_dealloc(PyVerifiedConstMap *self) {
-    fcm_verified_constmap_free(&self->vm);
+    pyverified_release(self);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -655,20 +734,69 @@ static PyObject *PyVerifiedConstMap_nbytes(PyVerifiedConstMap *self, PyObject *P
     return PyLong_FromUnsignedLongLong((unsigned long long)self->vm.data_len * 16ULL);
 }
 
+static PyObject *PyVerifiedConstMap_serialized_size(PyVerifiedConstMap *self, PyObject *Py_UNUSED(ignored)) {
+    return PyLong_FromSize_t(fcm_verified_constmap_serialized_size(&self->vm));
+}
+
+static PyObject *PyVerifiedConstMap_write_into(PyVerifiedConstMap *self, PyObject *arg) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(arg, &view, PyBUF_WRITABLE) < 0) return NULL;
+    size_t need = fcm_verified_constmap_serialized_size(&self->vm);
+    if (view.len < 0 || (size_t)view.len < need) {
+        PyErr_Format(PyExc_ValueError,
+                     "buffer too small: need %zu bytes, got %zd",
+                     need, view.len);
+        PyBuffer_Release(&view);
+        return NULL;
+    }
+    fcm_verified_constmap_write(&self->vm, view.buf);
+    PyBuffer_Release(&view);
+    return PyLong_FromSize_t(need);
+}
+
+static PyObject *PyVerifiedConstMap_from_buffer(PyTypeObject *type, PyObject *arg) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(arg, &view, PyBUF_SIMPLE) < 0) return NULL;
+    PyVerifiedConstMap *self = (PyVerifiedConstMap *)type->tp_alloc(type, 0);
+    if (!self) { PyBuffer_Release(&view); return NULL; }
+    int rc = fcm_verified_constmap_view(&self->vm, view.buf, (size_t)view.len);
+    if (rc != FCM_OK) {
+        PyBuffer_Release(&view);
+        Py_DECREF(self);
+        if (rc == FCM_E_UNALIGNED) {
+            PyErr_SetString(PyExc_ValueError,
+                "buffer is not 8-byte aligned; cannot create a zero-copy view "
+                "(use from_bytes() to copy instead)");
+        } else {
+            fcm_set_python_error(rc);
+        }
+        return NULL;
+    }
+    self->view = view;
+    return (PyObject *)self;
+}
+
 static PyMethodDef PyVerifiedConstMap_methods[] = {
-    {"get",        (PyCFunction)PyVerifiedConstMap_get,                       METH_VARARGS,
+    {"get",             (PyCFunction)PyVerifiedConstMap_get,                       METH_VARARGS,
      "Return value for `key`, or `default` (default None) if not present."},
-    {"get_many",   (PyCFunction)(void *)PyVerifiedConstMap_get_many,          METH_VARARGS | METH_KEYWORDS,
+    {"get_many",        (PyCFunction)(void *)PyVerifiedConstMap_get_many,          METH_VARARGS | METH_KEYWORDS,
      "Look up an iterable of keys; missing keys yield `default` (default None)."},
-    {"to_bytes",   (PyCFunction)PyVerifiedConstMap_serialize,                 METH_NOARGS,
+    {"to_bytes",        (PyCFunction)PyVerifiedConstMap_serialize,                 METH_NOARGS,
      "Serialize the map to bytes."},
-    {"from_bytes", (PyCFunction)PyVerifiedConstMap_deserialize,               METH_O | METH_CLASS,
-     "Deserialize a map from a bytes-like object."},
-    {"save",       (PyCFunction)PyVerifiedConstMap_save,                      METH_O,
+    {"from_bytes",      (PyCFunction)PyVerifiedConstMap_deserialize,               METH_O | METH_CLASS,
+     "Deserialize a map from a bytes-like object (copies the data)."},
+    {"serialized_size", (PyCFunction)PyVerifiedConstMap_serialized_size,           METH_NOARGS,
+     "Number of bytes that to_bytes()/write_into() will produce."},
+    {"write_into",      (PyCFunction)PyVerifiedConstMap_write_into,                METH_O,
+     "Serialize directly into a writable buffer (e.g. SharedMemory.buf). Returns bytes written."},
+    {"from_buffer",     (PyCFunction)PyVerifiedConstMap_from_buffer,               METH_O | METH_CLASS,
+     "Create a zero-copy map that reads directly from a buffer (e.g. shared memory). "
+     "The buffer is kept alive by the returned map and must not be modified while in use."},
+    {"save",            (PyCFunction)PyVerifiedConstMap_save,                      METH_O,
      "Save the map to a file path."},
-    {"load",       (PyCFunction)PyVerifiedConstMap_load,                      METH_O | METH_CLASS,
+    {"load",            (PyCFunction)PyVerifiedConstMap_load,                      METH_O | METH_CLASS,
      "Load a map from a file path."},
-    {"nbytes",     (PyCFunction)PyVerifiedConstMap_nbytes,                    METH_NOARGS,
+    {"nbytes",          (PyCFunction)PyVerifiedConstMap_nbytes,                    METH_NOARGS,
      "Heap size of the data + checks arrays in bytes."},
     {NULL, NULL, 0, NULL}
 };

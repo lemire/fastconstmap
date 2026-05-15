@@ -83,6 +83,78 @@ Keys must be unique (Python dict semantics already guarantee this).
 Construction raises `ValueError` in the extremely unlikely event of an
 xxhash collision (~2⁻⁶⁴ per key pair).
 
+## Sharing a map across processes (zero-copy)
+
+A map's serialized form *is* its in-memory lookup array (plus a small
+header). That means it can live in a
+[`multiprocessing.shared_memory`](https://docs.python.org/3/library/multiprocessing.shared_memory.html)
+block and be opened by any number of processes **without copying** — every
+process reads the same physical pages.
+
+Three methods make this work:
+
+| Method | Purpose |
+|--|--|
+| `m.serialized_size()` | bytes needed to hold the serialized map |
+| `m.write_into(buffer)` | serialize straight into a writable buffer (no intermediate `bytes`) |
+| `ConstMap.from_buffer(buffer)` | open a **zero-copy** map that reads directly from `buffer` |
+
+Producer — build once, publish into a **named** shared-memory block:
+
+```python
+from multiprocessing.shared_memory import SharedMemory
+from fastconstmap import ConstMap
+
+SHM_NAME = "fastconstmap_demo"
+
+cm = ConstMap({f"key-{i}": i for i in range(1_000_000)})
+
+shm = SharedMemory(create=True, size=cm.serialized_size(), name=SHM_NAME)
+cm.write_into(shm.buf)
+# keep `shm` alive (do not close/unlink) while consumers are running
+```
+
+Consumer — attach to the same name with no copy:
+
+```python
+from multiprocessing.shared_memory import SharedMemory
+from fastconstmap import ConstMap
+
+SHM_NAME = "fastconstmap_demo"
+
+shm = SharedMemory(name=SHM_NAME)           # attach by name, no `create=`
+cm = ConstMap.from_buffer(shm.buf)          # zero-copy: no per-process copy
+cm["key-42"]                                # reads straight from shared memory
+```
+
+Choosing the name yourself (rather than letting `SharedMemory` generate
+one) means consumers can hard-code it or read it from config — no need to
+pass the auto-generated name around. Pick a unique name; creating a block
+whose name already exists raises `FileExistsError`.
+
+Notes and constraints:
+
+- **`from_buffer` does not copy.** The returned map holds a reference to the
+  buffer; the buffer (and, for shared memory, the `SharedMemory` object)
+  must stay alive and **must not be closed or mutated** while the map is in
+  use. Drop the map (`del cm`) before calling `shm.close()`.
+- The map is **immutable** — the intended pattern is *write once in the
+  producer, then only read in every process*. Concurrent readers need no
+  locking.
+- `from_buffer` verifies the magic bytes and the FNV-1a checksum, so a
+  truncated or corrupt block raises `ValueError` rather than returning
+  garbage.
+- Requirements: a **little-endian** host (x86-64, ARM64, …) and an
+  **8-byte-aligned** buffer. `SharedMemory.buf`, `bytes`, and `bytearray`
+  all satisfy the alignment requirement; an offset slice of a buffer may
+  not, in which case `from_buffer` raises `ValueError` — use
+  `from_bytes()` (which copies) instead.
+- `VerifiedConstMap` supports the same three methods.
+
+`from_bytes()` remains available when you *want* an owned copy (or need to
+load on a big-endian host): it copies the data and the resulting map owns
+its memory independently of the source buffer.
+
 ## Benchmark
 
 On an Apple M-series CPU, with 1,000,000 string keys

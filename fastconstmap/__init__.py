@@ -14,7 +14,9 @@ Two classes are exposed:
   works.
 
 Both types are immutable after construction and can be serialised to bytes
-or to a file path.
+or to a file path. They can also be placed in a ``multiprocessing``
+``SharedMemory`` block and opened by many processes with no per-process
+copy — see ``serialized_size``, ``write_into`` and ``from_buffer``.
 """
 from ._fastconstmap import ConstMap, VerifiedConstMap
 

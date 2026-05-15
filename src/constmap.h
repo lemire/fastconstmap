@@ -25,6 +25,7 @@ extern "C" {
 #define FCM_E_INVALID_FORMAT     -5
 #define FCM_E_CHECKSUM           -6
 #define FCM_E_SHORT_BUFFER       -7
+#define FCM_E_UNALIGNED          -8
 
 #define FCM_NOT_FOUND ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
 
@@ -84,6 +85,24 @@ int    fcm_constmap_read (fcm_constmap_t *out, const void *buf, size_t buf_len);
 size_t fcm_verified_constmap_serialized_size(const fcm_verified_constmap_t *vm);
 int    fcm_verified_constmap_write(const fcm_verified_constmap_t *vm, void *buf);
 int    fcm_verified_constmap_read (fcm_verified_constmap_t *out, const void *buf, size_t buf_len);
+
+/* Zero-copy views over a serialized buffer.
+ *
+ * Unlike `*_read`, these do NOT copy: `out->data` (and `out->checks`) point
+ * directly into `buf`. This makes a map openable from shared memory with no
+ * per-process copy.
+ *
+ * Requirements: a little-endian host and a buffer whose start is 8-byte
+ * aligned (so the embedded uint64 arrays are aligned). The serialized
+ * format pads its header to a multiple of 8 to guarantee this.
+ *
+ * Returns FCM_OK, or FCM_E_UNALIGNED / FCM_E_INVALID_FORMAT (e.g. on a
+ * big-endian host) / FCM_E_CHECKSUM / FCM_E_SHORT_BUFFER.
+ *
+ * The caller MUST keep `buf` alive for the lifetime of `out`, and MUST NOT
+ * call `fcm_*_free` on a view (the data is borrowed, not owned). */
+int fcm_constmap_view(fcm_constmap_t *out, const void *buf, size_t buf_len);
+int fcm_verified_constmap_view(fcm_verified_constmap_t *out, const void *buf, size_t buf_len);
 
 #ifdef __cplusplus
 }
