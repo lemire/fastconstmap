@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastconstmap"
+version = "0.1.0"
+description = "Fast, immutable, compact map from strings to uint64 (binary fuse filter)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Daniel Lemire", email = "daniel@lemire.me" }]
+requires-python = ">=3.8"
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/lemire/fastconstmap"
+Source   = "https://github.com/lemire/fastconstmap"
+
+[tool.setuptools]
+packages = ["fastconstmap"]
+
+[tool.setuptools.package-data]
+fastconstmap = ["py.typed"]
