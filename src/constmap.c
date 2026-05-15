@@ -416,6 +416,7 @@ int fcm_constmap_new(fcm_constmap_t *out,
     out->segment_count        = params.segment_count;
     out->segment_count_length = params.segment_count_length;
     out->data_len             = params.array_len;
+    out->n                    = size;
     out->data                 = data;
     data = NULL;  /* ownership transferred */
 
@@ -497,6 +498,7 @@ int fcm_verified_constmap_new(fcm_verified_constmap_t *out,
     out->segment_count        = params.segment_count;
     out->segment_count_length = params.segment_count_length;
     out->data_len             = params.array_len;
+    out->n                    = size;
     out->data                 = data;
     out->checks               = checks;
     data   = NULL;
@@ -631,7 +633,7 @@ int fcm_constmap_write(const fcm_constmap_t *cm, void *buf) {
     fcm_write_u32(p, cm->segment_length); p += 4;
     fcm_write_u32(p, cm->segment_count);  p += 4;
     fcm_write_u32(p, cm->data_len);       p += 4;
-    fcm_write_u32(p, 0);                  p += 4;  /* reserved padding */
+    fcm_write_u32(p, cm->n);              p += 4;  /* original key count (was reserved) */
     for (uint32_t i = 0; i < cm->data_len; i++) {
         fcm_write_u64(p, cm->data[i]); p += 8;
     }
@@ -652,6 +654,7 @@ int fcm_constmap_read(fcm_constmap_t *out, const void *buf, size_t buf_len) {
     uint32_t segment_length  = fcm_read_u32(p + 16);
     uint32_t segment_count   = fcm_read_u32(p + 20);
     uint32_t data_len        = fcm_read_u32(p + 24);
+    uint32_t n               = fcm_read_u32(p + 28);  /* original key count */
 
     size_t expected = FCM_HEADER_SIZE + (size_t)data_len * 8u + FCM_TRAILER_SIZE;
     if (buf_len < expected) return FCM_E_SHORT_BUFFER;
@@ -675,6 +678,7 @@ int fcm_constmap_read(fcm_constmap_t *out, const void *buf, size_t buf_len) {
     out->segment_count        = segment_count;
     out->segment_count_length = segment_count * segment_length;
     out->data_len             = data_len;
+    out->n                    = n;
     out->data                 = data;
     return FCM_OK;
 }
@@ -691,7 +695,7 @@ int fcm_verified_constmap_write(const fcm_verified_constmap_t *vm, void *buf) {
     fcm_write_u32(p, vm->segment_length); p += 4;
     fcm_write_u32(p, vm->segment_count);  p += 4;
     fcm_write_u32(p, vm->data_len);       p += 4;
-    fcm_write_u32(p, 0);                  p += 4;  /* reserved padding */
+    fcm_write_u32(p, vm->n);              p += 4;  /* original key count (was reserved) */
     for (uint32_t i = 0; i < vm->data_len; i++) {
         fcm_write_u64(p, vm->data[i]); p += 8;
     }
@@ -715,6 +719,7 @@ int fcm_verified_constmap_read(fcm_verified_constmap_t *out, const void *buf, si
     uint32_t segment_length  = fcm_read_u32(p + 16);
     uint32_t segment_count   = fcm_read_u32(p + 20);
     uint32_t data_len        = fcm_read_u32(p + 24);
+    uint32_t n               = fcm_read_u32(p + 28);  /* original key count */
 
     size_t expected = FCM_HEADER_SIZE + (size_t)data_len * 16u + FCM_TRAILER_SIZE;
     if (buf_len < expected) return FCM_E_SHORT_BUFFER;
@@ -744,6 +749,7 @@ int fcm_verified_constmap_read(fcm_verified_constmap_t *out, const void *buf, si
     out->segment_count        = segment_count;
     out->segment_count_length = segment_count * segment_length;
     out->data_len             = data_len;
+    out->n                    = n;
     out->data                 = data;
     out->checks               = checks;
     return FCM_OK;
@@ -785,6 +791,7 @@ int fcm_constmap_view(fcm_constmap_t *out, const void *buf, size_t buf_len) {
     out->segment_count        = fcm_read_u32(p + 20);
     out->segment_count_length = out->segment_count * segment_length;
     out->data_len             = data_len;
+    out->n                    = fcm_read_u32(p + 28);  /* original key count */
     /* Borrowed pointer into `buf`; the integer round-trip launders away the
      * source const-ness. Lookups only read this array. */
     out->data = (uint64_t *)(uintptr_t)dp;
@@ -819,6 +826,7 @@ int fcm_verified_constmap_view(fcm_verified_constmap_t *out, const void *buf, si
     out->segment_count        = fcm_read_u32(p + 20);
     out->segment_count_length = out->segment_count * segment_length;
     out->data_len             = data_len;
+    out->n                    = fcm_read_u32(p + 28);  /* original key count */
     out->data   = (uint64_t *)(uintptr_t)dp;
     out->checks = (uint64_t *)(uintptr_t)cp;
     return FCM_OK;
