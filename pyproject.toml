@@ -27,3 +27,18 @@ packages = ["fastconstmap"]
 
 [tool.setuptools.package-data]
 fastconstmap = ["py.typed"]
+
+[tool.cibuildwheel]
+# Build wheels for all platforms. Test the freshly-built wheel against
+# our pytest suite — catches packaging regressions before they ship.
+test-requires = "pytest"
+test-command = "pytest {project}/tests"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "universal2", "arm64"]
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
