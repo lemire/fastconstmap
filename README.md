@@ -1,6 +1,7 @@
 # fastconstmap
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Test](https://github.com/lemire/fastconstmap/actions/workflows/test.yml/badge.svg)](https://github.com/lemire/fastconstmap/actions/workflows/test.yml)
 
 Fast, immutable, compact map from strings to 64-bit integers — for Python.
 
