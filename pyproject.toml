@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastconstmap"
-version = "0.7.0"
+version = "0.8.0"
 description = "Fast, immutable, compact map from strings to uint64 (binary fuse filter)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
