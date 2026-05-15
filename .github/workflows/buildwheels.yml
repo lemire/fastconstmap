@@ -29,8 +29,13 @@ jobs:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # ubuntu-latest      -> x86_64 manylinux wheels
+        # ubuntu-24.04-arm   -> aarch64 manylinux wheels (native ARM64 runner)
+        # macos-latest       -> macOS x86_64 / arm64 / universal2
+        # windows-latest     -> Windows AMD64
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4

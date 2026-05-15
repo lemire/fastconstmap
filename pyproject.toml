@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastconstmap"
-version = "0.6.0"
+version = "0.7.0"
 description = "Fast, immutable, compact map from strings to uint64 (binary fuse filter)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -38,7 +38,10 @@ test-command = "pytest {project}/tests"
 archs = ["x86_64", "universal2", "arm64"]
 
 [tool.cibuildwheel.linux]
-archs = ["x86_64"]
+# "auto64" = the runner's native 64-bit arch (no 32-bit i686). The wheels
+# workflow runs this on both an x86_64 runner and an aarch64 runner, so
+# this produces x86_64 and aarch64 manylinux wheels — each built natively.
+archs = ["auto64"]
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
