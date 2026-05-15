@@ -23,6 +23,19 @@ def test_empty():
     assert len(m) == 0
 
 
+def test_len():
+    d = {"apple": 100, "banana": 200, "cherry": 300}
+    m = ConstMap(d)
+    assert len(m) == 3
+
+
+def test_len_after_serialization():
+    d = {"a": 1, "b": 2, "c": 3, "d": 4}
+    m = ConstMap(d)
+    m2 = ConstMap.from_bytes(m.to_bytes())
+    assert len(m2) == 4
+
+
 def test_single_key():
     m = ConstMap({"only": 42})
     assert m["only"] == 42
@@ -146,6 +159,19 @@ def test_verified_basic():
     vm = VerifiedConstMap(d)
     for k, v in d.items():
         assert vm[k] == v
+
+
+def test_verified_len():
+    d = {"apple": 100, "banana": 200, "cherry": 300}
+    vm = VerifiedConstMap(d)
+    assert len(vm) == 3
+
+
+def test_verified_len_after_serialization():
+    d = {"a": 1, "b": 2, "c": 3, "d": 4}
+    vm = VerifiedConstMap(d)
+    vm2 = VerifiedConstMap.from_bytes(vm.to_bytes())
+    assert len(vm2) == 4
 
 
 def test_verified_missing_raises():

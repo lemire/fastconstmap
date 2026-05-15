@@ -36,6 +36,7 @@ typedef struct fcm_constmap {
     uint32_t  segment_count;
     uint32_t  segment_count_length;
     uint32_t  data_len;
+    uint32_t  n;          /* original number of inserted keys */
     uint64_t *data;
 } fcm_constmap_t;
 
@@ -46,6 +47,7 @@ typedef struct fcm_verified_constmap {
     uint32_t  segment_count;
     uint32_t  segment_count_length;
     uint32_t  data_len;
+    uint32_t  n;          /* original number of inserted keys */
     uint64_t *data;
     uint64_t *checks;
 } fcm_verified_constmap_t;

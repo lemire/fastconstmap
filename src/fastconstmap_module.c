@@ -290,10 +290,7 @@ fail:
 }
 
 static Py_ssize_t PyConstMap_length(PyConstMap *self) {
-    /* The ConstMap doesn't actually retain the original size, only data_len.
-     * The Python wrapper stores it separately if needed; here we report 0
-     * since we don't track it (Map is anonymous). */
-    return (Py_ssize_t)self->cm.data_len;
+    return (Py_ssize_t)self->cm.n;
 }
 
 static PyObject *PyConstMap_subscript(PyConstMap *self, PyObject *key) {
@@ -661,7 +658,7 @@ fail:
 }
 
 static Py_ssize_t PyVerifiedConstMap_length(PyVerifiedConstMap *self) {
-    return (Py_ssize_t)self->vm.data_len;
+    return (Py_ssize_t)self->vm.n;
 }
 
 static PyObject *PyVerifiedConstMap_serialize(PyVerifiedConstMap *self, PyObject *Py_UNUSED(ignored)) {
