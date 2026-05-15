@@ -21,4 +21,4 @@ copy — see ``serialized_size``, ``write_into`` and ``from_buffer``.
 from ._fastconstmap import ConstMap, VerifiedConstMap
 
 __all__ = ["ConstMap", "VerifiedConstMap"]
-__version__ = "0.5.0"
+__version__ = "0.6.0"
