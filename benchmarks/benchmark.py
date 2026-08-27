@@ -4,9 +4,19 @@ Run as:
     python benchmarks/benchmark.py [N]
 
 Defaults to N = 1,000,000 keys.
+
+Lookups are timed over the whole key set, in random order, from a list built
+in that order — the methodology of the Go original. Both halves matter. Random
+order is what a caller actually has; walking the keys in construction order
+lets the prefetcher hide work a real lookup must do. Building the query list in
+draw order keeps the measurement about the map: permuting a list built in index
+order would leave every string body where it was and charge each lookup for a
+scattered read of this script's own key text, a cost that belongs to whatever
+produced the keys.
 """
 from __future__ import annotations
 import argparse
+import array
 import random
 import sys
 import time
@@ -30,7 +40,7 @@ def time_loop(label: str, iterations: int, fn: Callable[[int], None]) -> float:
         fn(i)
     elapsed = time.perf_counter() - t0
     per_op_ns = elapsed * 1e9 / iterations
-    print(f"  {label:<28} {per_op_ns:8.1f} ns/op  ({elapsed:.3f} s total)")
+    print(f"  {label:<38} {per_op_ns:8.1f} ns/op  ({elapsed:.3f} s total)")
     return per_op_ns
 
 
@@ -42,13 +52,13 @@ def time_batch(label: str, batches: int, batch_size: int, fn: Callable[[], None]
         fn()
     elapsed = time.perf_counter() - t0
     per_op_ns = elapsed * 1e9 / (batches * batch_size)
-    print(f"  {label:<28} {per_op_ns:8.1f} ns/op  "
+    print(f"  {label:<38} {per_op_ns:8.1f} ns/op  "
           f"({elapsed*1000/batches:.2f} ms/batch of {batch_size})")
     return per_op_ns
 
 
 def report_size(label: str, value: int, n: int) -> None:
-    print(f"  {label:<28} {value:12,} bytes  ({value/n:.2f} bytes/key)")
+    print(f"  {label:<38} {value:12,} bytes  ({value/n:.2f} bytes/key)")
 
 
 def deep_sizeof(obj, seen: set[int] | None = None) -> int:
@@ -79,10 +89,11 @@ def deep_sizeof(obj, seen: set[int] | None = None) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("n", type=int, nargs="?", default=1_000_000)
-    parser.add_argument("--lookups", type=int, default=2_000_000,
-                        help="number of individual lookups to time")
-    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=2000)
     parser.add_argument("--batches",    type=int, default=2000)
+    parser.add_argument("--pools",      type=int, default=64,
+                        help="distinct random batches rotated through in the "
+                             "cold regime, to avoid artificial cache warmth")
     args = parser.parse_args()
     n = args.n
 
@@ -90,23 +101,26 @@ def main() -> None:
           f"python {sys.version.split()[0]} ===\n")
 
     keys, d = make_data(n)
-    # Lookup index pattern: shuffled to avoid trivial cache wins.
+    # Query order: every key exactly once, drawn at random, with the key list
+    # built in that same order (see the module docstring).
     rng = random.Random(1234)
-    lookup_idx = [rng.randrange(n) for _ in range(args.lookups)]
+    perm = list(range(n))
+    rng.shuffle(perm)
+    query = [str(keys[j]) for j in perm]
 
     # ---- Construction time ----
     print("Construction:")
     t0 = time.perf_counter()
     cm = ConstMap(d)
-    print(f"  ConstMap.__init__              {time.perf_counter()-t0:7.3f} s")
+    print(f"  ConstMap.__init__                     {time.perf_counter()-t0:7.3f} s")
 
     t0 = time.perf_counter()
     vm = VerifiedConstMap(d)
-    print(f"  VerifiedConstMap.__init__      {time.perf_counter()-t0:7.3f} s")
+    print(f"  VerifiedConstMap.__init__             {time.perf_counter()-t0:7.3f} s")
 
     t0 = time.perf_counter()
     pyd = dict(d)
-    print(f"  dict(d)                        {time.perf_counter()-t0:7.3f} s")
+    print(f"  dict(d)                               {time.perf_counter()-t0:7.3f} s")
 
     # ---- Memory ----
     # The ConstMap retains no string objects: cm.nbytes() is its entire
@@ -118,35 +132,58 @@ def main() -> None:
     report_size("VerifiedConstMap.nbytes", vm.nbytes(), n)
     dict_total = deep_sizeof(pyd)
     report_size("dict (table+keys+values)", dict_total, n)
-    print(f"  ratio dict / ConstMap          {dict_total / cm.nbytes():.1f}x")
+    print(f"  {'ratio dict / ConstMap':<38} {dict_total / cm.nbytes():.1f}x")
 
     # ---- Single lookup ----
-    print(f"\nSingle lookup, {args.lookups:,} ops:")
+    print(f"\nSingle lookup, every key once in random order ({n:,} ops):")
 
-    time_loop("dict[k]",                     args.lookups, lambda i: pyd[keys[lookup_idx[i]]])
-    time_loop("ConstMap[k]",                 args.lookups, lambda i: cm[keys[lookup_idx[i]]])
-    time_loop("VerifiedConstMap[k]",         args.lookups, lambda i: vm[keys[lookup_idx[i]]])
+    time_loop("dict[k]",             n, lambda i: pyd[query[i]])
+    time_loop("ConstMap[k]",         n, lambda i: cm[query[i]])
+    time_loop("VerifiedConstMap[k]", n, lambda i: vm[query[i]])
 
     # ---- Batched lookup ----
-    batch_keys = [keys[rng.randrange(n)] for _ in range(args.batch_size)]
+    # Cold rotates through many distinct random batches, so the cache lines a
+    # batch touches are not already resident; hot replays one batch, so the
+    # touched region stays cache-resident and hashing dominates instead. Each
+    # batch is built as its own list of freshly drawn keys, so a lookup is not
+    # also charged for a scattered walk over the full key list.
+    pools = [[str(keys[rng.randrange(n)]) for _ in range(args.batch_size)]
+             for _ in range(args.pools)]
+    hot = pools[0]
+    out = array.array("Q", [0]) * args.batch_size
+    npools = args.pools
+    counter = {"i": 0}
+
+    def cold():
+        i = counter["i"] = counter["i"] + 1
+        return pools[i % npools]
+
     print(f"\nBatched lookup, {args.batches} × {args.batch_size}:")
 
     # dict batch: pure Python list comprehension is the natural comparison.
-    time_batch("dict comprehension",         args.batches, args.batch_size,
-               lambda: [pyd[k] for k in batch_keys])
-    time_batch("ConstMap.get_many",          args.batches, args.batch_size,
-               lambda: cm.get_many(batch_keys))
-    time_batch("VerifiedConstMap.get_many",  args.batches, args.batch_size,
-               lambda: vm.get_many(batch_keys))
+    time_batch("dict comprehension (cold)",       args.batches, args.batch_size,
+               lambda: [pyd[k] for k in cold()])
+    time_batch("ConstMap.get_many (cold)",        args.batches, args.batch_size,
+               lambda: cm.get_many(cold()))
+    time_batch("ConstMap.get_many (hot)",         args.batches, args.batch_size,
+               lambda: cm.get_many(hot))
+    time_batch("ConstMap.get_many_into (cold)",   args.batches, args.batch_size,
+               lambda: cm.get_many_into(cold(), out))
+    time_batch("ConstMap.get_many_into (hot)",    args.batches, args.batch_size,
+               lambda: cm.get_many_into(hot, out))
+    time_batch("VerifiedConstMap.get_many (cold)", args.batches, args.batch_size,
+               lambda: vm.get_many(cold()))
+    time_batch("VerifiedConstMap.get_many_into (cold)", args.batches, args.batch_size,
+               lambda: vm.get_many_into(cold(), out))
 
     # ---- Serialization ----
     print("\nSerialization:")
     t0 = time.perf_counter()
     blob = cm.to_bytes()
-    print(f"  ConstMap.to_bytes              {time.perf_counter()-t0:7.3f} s  ({len(blob):,} bytes)")
+    print(f"  {'ConstMap.to_bytes':<38}{time.perf_counter()-t0:7.3f} s  ({len(blob):,} bytes)")
     t0 = time.perf_counter()
     cm2 = ConstMap.from_bytes(blob)
-    print(f"  ConstMap.from_bytes            {time.perf_counter()-t0:7.3f} s")
+    print(f"  {'ConstMap.from_bytes':<38}{time.perf_counter()-t0:7.3f} s")
     # Verify round-trip.
     assert cm2[keys[0]] == d[keys[0]]
 

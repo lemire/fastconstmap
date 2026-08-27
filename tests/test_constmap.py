@@ -1,11 +1,12 @@
 """Tests for fastconstmap."""
+import array
 import os
 import random
 import tempfile
 
 import pytest
 
-from fastconstmap import ConstMap, VerifiedConstMap
+from fastconstmap import NOT_FOUND, ConstMap, VerifiedConstMap
 
 
 # ----- ConstMap -----
@@ -238,3 +239,112 @@ def test_constmap_and_verified_use_distinct_magic():
         VerifiedConstMap.from_bytes(cm.to_bytes())
     with pytest.raises(ValueError):
         ConstMap.from_bytes(vm.to_bytes())
+
+
+# ----- Batched lookups -----
+
+def test_get_many_crosses_block_boundaries():
+    # The core hashes a block of keys at a time; run a size that is not a
+    # multiple of the block so the tail path is exercised too.
+    for n in (1, 7, 8, 9, 63, 64, 65, 1000):
+        d = {f"key{i}": i * 7 for i in range(n)}
+        m = ConstMap(d)
+        keys = list(d)
+        assert m.get_many(keys) == [d[k] for k in keys]
+
+
+def test_get_many_matches_single_lookup():
+    rng = random.Random(99)
+    d = {f"k{i}-{rng.random()}": rng.randrange(1 << 63) for i in range(5000)}
+    m = ConstMap(d)
+    keys = list(d)
+    rng.shuffle(keys)
+    assert m.get_many(keys) == [m[k] for k in keys]
+
+
+def test_get_many_empty_and_mixed_types():
+    d = {"a": 1, b"b": 2}
+    m = ConstMap(d)
+    assert m.get_many([]) == []
+    assert m.get_many(["a", b"b"]) == [1, 2]
+
+
+def test_get_many_rejects_non_string_key():
+    m = ConstMap({"a": 1})
+    with pytest.raises(TypeError):
+        m.get_many(["a", 42])
+
+
+def test_get_many_into():
+    d = {f"key{i}": i * 3 for i in range(1000)}
+    m = ConstMap(d)
+    keys = list(d)
+    out = array.array("Q", [0]) * len(keys)
+    assert m.get_many_into(keys, out) == len(keys)
+    assert list(out) == [d[k] for k in keys]
+
+
+def test_get_many_into_unaligned_buffer():
+    # A memoryview starting at an odd offset takes the staged path.
+    d = {f"key{i}": i for i in range(100)}
+    m = ConstMap(d)
+    keys = list(d)
+    raw = bytearray(8 * len(keys) + 8)
+    view = memoryview(raw)[1:1 + 8 * len(keys)]
+    assert m.get_many_into(keys, view) == len(keys)
+    got = array.array("Q")
+    got.frombytes(bytes(view))
+    assert list(got) == [d[k] for k in keys]
+
+
+def test_get_many_into_buffer_too_small():
+    m = ConstMap({"a": 1, "b": 2})
+    out = array.array("Q", [0])
+    with pytest.raises(ValueError):
+        m.get_many_into(["a", "b"], out)
+
+
+def test_get_many_into_rejects_readonly_buffer():
+    m = ConstMap({"a": 1})
+    with pytest.raises((TypeError, BufferError)):
+        m.get_many_into(["a"], b"\x00" * 8)
+
+
+def test_verified_get_many_crosses_block_boundaries():
+    for n in (1, 7, 8, 9, 63, 64, 65, 1000):
+        d = {f"key{i}": i * 7 for i in range(n)}
+        vm = VerifiedConstMap(d)
+        keys = list(d) + ["missing-key", "another-missing"]
+        assert vm.get_many(keys, default=-1) == [d[k] for k in d] + [-1, -1]
+
+
+def test_verified_get_many_matches_single_lookup():
+    rng = random.Random(4242)
+    d = {f"k{i}-{rng.random()}": rng.randrange(1 << 63) for i in range(5000)}
+    vm = VerifiedConstMap(d)
+    keys = list(d)[:2500] + [f"absent-{i}" for i in range(2500)]
+    rng.shuffle(keys)
+    assert vm.get_many(keys) == [vm.get(k) for k in keys]
+
+
+def test_verified_get_many_into_marks_missing():
+    d = {f"key{i}": i * 5 for i in range(500)}
+    vm = VerifiedConstMap(d)
+    keys = list(d) + ["nope", "still-nope"]
+    out = array.array("Q", [0]) * len(keys)
+    assert vm.get_many_into(keys, out) == len(keys)
+    assert list(out[:500]) == [d[k] for k in list(d)]
+    assert out[500] == NOT_FOUND
+    assert out[501] == NOT_FOUND
+
+
+def test_get_many_into_empty_map():
+    out = array.array("Q", [0]) * 4
+    ConstMap({}).get_many_into(["a", "b", "c", "d"], out)
+    assert list(out) == [0, 0, 0, 0]
+    VerifiedConstMap({}).get_many_into(["a", "b", "c", "d"], out)
+    assert list(out) == [NOT_FOUND] * 4
+
+
+def test_not_found_sentinel():
+    assert NOT_FOUND == 2 ** 64 - 1

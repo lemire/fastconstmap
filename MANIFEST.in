@@ -7,4 +7,4 @@ recursive-include src/third_party *
 recursive-include fastconstmap *.py *.pyi py.typed
 recursive-include tests *.py
 recursive-include examples *.py
-recursive-include benchmarks *.py
+recursive-include benchmarks *.py *.c

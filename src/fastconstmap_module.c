@@ -13,6 +13,54 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
+/* Batched-lookup helpers                                                    */
+/* ------------------------------------------------------------------------- */
+
+/* How many keys are extracted from Python objects before the batch is handed
+ * to the C core. Larger than the core's own block size, so one call spans
+ * several blocks, but small enough that the key array stays in L1. */
+#define FCM_PY_CHUNK 64
+
+/* Point `key` at the UTF-8 (str) or raw (bytes) contents of `obj`. The pointer
+ * borrows from `obj`, which the caller must keep alive for the lookup. Sets an
+ * exception and returns -1 for any other type. */
+static inline int fcm_key_from_object(PyObject *obj, fcm_key_t *key) {
+    Py_ssize_t len;
+    if (PyUnicode_Check(obj)) {
+        const char *s = PyUnicode_AsUTF8AndSize(obj, &len);
+        if (!s) return -1;
+        key->bytes = s;
+        key->len   = (size_t)len;
+        return 0;
+    }
+    if (PyBytes_Check(obj)) {
+        char *s;
+        if (PyBytes_AsStringAndSize(obj, &s, &len) < 0) return -1;
+        key->bytes = s;
+        key->len   = (size_t)len;
+        return 0;
+    }
+    PyErr_Format(PyExc_TypeError, "keys must be str or bytes, not %s",
+                 Py_TYPE(obj)->tp_name);
+    return -1;
+}
+
+/* Acquire a writable buffer able to hold `n` uint64 values. On success the
+ * caller must release `view`. */
+static int fcm_out_buffer(PyObject *obj, Py_ssize_t n, Py_buffer *view) {
+    if (PyObject_GetBuffer(obj, view, PyBUF_WRITABLE) < 0) return -1;
+    Py_ssize_t need = n * (Py_ssize_t)sizeof(uint64_t);
+    if (view->len < need) {
+        PyErr_Format(PyExc_ValueError,
+                     "output buffer too small: need %zd bytes for %zd keys, got %zd",
+                     need, n, view->len);
+        PyBuffer_Release(view);
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Error helpers                                                             */
 /* ------------------------------------------------------------------------- */
 
@@ -217,76 +265,84 @@ static PyObject *PyConstMap_get(PyConstMap *self, PyObject *arg) {
     return PyLong_FromUnsignedLongLong((unsigned long long)v);
 }
 
-/* Batch lookup: input is any iterable of str/bytes; returns a list of ints. */
+/* Batch lookup: input is any iterable of str/bytes; returns a list of ints.
+ *
+ * Keys are handed to the core in chunks so that it can overlap the memory
+ * accesses of a whole block (see fcm_constmap_lookup_many); that is where the
+ * gain over a loop of single lookups comes from once the map no longer fits in
+ * cache. */
 static PyObject *PyConstMap_get_many(PyConstMap *self, PyObject *arg) {
-    /* Fast path for lists/tuples: avoid iterator overhead. */
-    if (PyList_Check(arg) || PyTuple_Check(arg)) {
-        Py_ssize_t n = PySequence_Fast_GET_SIZE(arg);
-        PyObject **items = PySequence_Fast_ITEMS(arg);
-        PyObject *out = PyList_New(n);
-        if (!out) return NULL;
-        for (Py_ssize_t i = 0; i < n; i++) {
-            PyObject *k = items[i];
-            const char *s;
-            Py_ssize_t klen;
-            if (PyUnicode_Check(k)) {
-                s = PyUnicode_AsUTF8AndSize(k, &klen);
-                if (!s) { Py_DECREF(out); return NULL; }
-            } else if (PyBytes_Check(k)) {
-                if (PyBytes_AsStringAndSize(k, (char **)&s, &klen) < 0) {
-                    Py_DECREF(out); return NULL;
-                }
-            } else {
-                Py_DECREF(out);
-                PyErr_Format(PyExc_TypeError,
-                             "keys must be str or bytes, not %s",
-                             Py_TYPE(k)->tp_name);
-                return NULL;
-            }
-            uint64_t v = fcm_constmap_lookup(&self->cm, s, (size_t)klen);
-            PyObject *iv = PyLong_FromUnsignedLongLong((unsigned long long)v);
-            if (!iv) { Py_DECREF(out); return NULL; }
-            PyList_SET_ITEM(out, i, iv);
-        }
-        return out;
-    }
+    PyObject *seq = PySequence_Fast(arg, "get_many() requires an iterable of keys");
+    if (!seq) return NULL;
+    Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
+    PyObject   **items = PySequence_Fast_ITEMS(seq);
+    PyObject    *out   = PyList_New(n);
+    if (!out) { Py_DECREF(seq); return NULL; }
 
-    /* General iterable. */
-    PyObject *it = PyObject_GetIter(arg);
-    if (!it) return NULL;
-    PyObject *out = PyList_New(0);
-    if (!out) { Py_DECREF(it); return NULL; }
-    PyObject *item;
-    while ((item = PyIter_Next(it)) != NULL) {
-        const char *s;
-        Py_ssize_t klen;
-        if (PyUnicode_Check(item)) {
-            s = PyUnicode_AsUTF8AndSize(item, &klen);
-            if (!s) { Py_DECREF(item); goto fail; }
-        } else if (PyBytes_Check(item)) {
-            if (PyBytes_AsStringAndSize(item, (char **)&s, &klen) < 0) {
-                Py_DECREF(item); goto fail;
-            }
-        } else {
-            PyErr_Format(PyExc_TypeError,
-                         "keys must be str or bytes, not %s",
-                         Py_TYPE(item)->tp_name);
-            Py_DECREF(item); goto fail;
+    fcm_key_t kbuf[FCM_PY_CHUNK];
+    uint64_t  vbuf[FCM_PY_CHUNK];
+    for (Py_ssize_t base = 0; base < n; base += FCM_PY_CHUNK) {
+        Py_ssize_t m = n - base < FCM_PY_CHUNK ? n - base : FCM_PY_CHUNK;
+        for (Py_ssize_t j = 0; j < m; j++) {
+            if (fcm_key_from_object(items[base + j], &kbuf[j]) < 0) goto fail;
         }
-        uint64_t v = fcm_constmap_lookup(&self->cm, s, (size_t)klen);
-        Py_DECREF(item);
-        PyObject *iv = PyLong_FromUnsignedLongLong((unsigned long long)v);
-        if (!iv) goto fail;
-        if (PyList_Append(out, iv) < 0) { Py_DECREF(iv); goto fail; }
-        Py_DECREF(iv);
+        fcm_constmap_lookup_many(&self->cm, kbuf, (size_t)m, vbuf);
+        for (Py_ssize_t j = 0; j < m; j++) {
+            PyObject *iv = PyLong_FromUnsignedLongLong((unsigned long long)vbuf[j]);
+            if (!iv) goto fail;
+            PyList_SET_ITEM(out, base + j, iv);
+        }
     }
-    Py_DECREF(it);
-    if (PyErr_Occurred()) { Py_DECREF(out); return NULL; }
+    Py_DECREF(seq);
     return out;
 fail:
-    Py_DECREF(it);
+    Py_DECREF(seq);
     Py_DECREF(out);
     return NULL;
+}
+
+/* Batch lookup writing into a caller-owned buffer of 64-bit words (an
+ * array("Q"), a numpy uint64 array, a SharedMemory block, ...). No Python int
+ * is created per key, so a repeated batch neither allocates nor boxes.
+ * Returns the number of values written. */
+static PyObject *PyConstMap_get_many_into(PyConstMap *self, PyObject *args) {
+    PyObject *keys_arg, *out_arg;
+    if (!PyArg_ParseTuple(args, "OO:get_many_into", &keys_arg, &out_arg)) return NULL;
+
+    PyObject *seq = PySequence_Fast(keys_arg, "get_many_into() requires an iterable of keys");
+    if (!seq) return NULL;
+    Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
+    PyObject   **items = PySequence_Fast_ITEMS(seq);
+
+    Py_buffer view;
+    if (fcm_out_buffer(out_arg, n, &view) < 0) { Py_DECREF(seq); return NULL; }
+
+    /* Write straight into the buffer when it is 8-byte aligned (array("Q"),
+     * numpy and SharedMemory all are); otherwise stage through a local block. */
+    int aligned = (((uintptr_t)view.buf) & 7u) == 0;
+    fcm_key_t kbuf[FCM_PY_CHUNK];
+    uint64_t  vbuf[FCM_PY_CHUNK];
+    for (Py_ssize_t base = 0; base < n; base += FCM_PY_CHUNK) {
+        Py_ssize_t m = n - base < FCM_PY_CHUNK ? n - base : FCM_PY_CHUNK;
+        for (Py_ssize_t j = 0; j < m; j++) {
+            if (fcm_key_from_object(items[base + j], &kbuf[j]) < 0) {
+                PyBuffer_Release(&view);
+                Py_DECREF(seq);
+                return NULL;
+            }
+        }
+        if (aligned) {
+            fcm_constmap_lookup_many(&self->cm, kbuf, (size_t)m,
+                                     (uint64_t *)view.buf + base);
+        } else {
+            fcm_constmap_lookup_many(&self->cm, kbuf, (size_t)m, vbuf);
+            memcpy((char *)view.buf + (size_t)base * sizeof(uint64_t),
+                   vbuf, (size_t)m * sizeof(uint64_t));
+        }
+    }
+    PyBuffer_Release(&view);
+    Py_DECREF(seq);
+    return PyLong_FromSsize_t(n);
 }
 
 static Py_ssize_t PyConstMap_length(PyConstMap *self) {
@@ -426,6 +482,12 @@ static PyMethodDef PyConstMap_methods[] = {
      "Return the value for `key`. If `key` was not in the original mapping, the return value is undefined."},
     {"get_many",        (PyCFunction)PyConstMap_get_many,        METH_O,
      "Look up an iterable of keys. Returns a list of ints in the same order."},
+    {"get_many_into",   (PyCFunction)PyConstMap_get_many_into,   METH_VARARGS,
+     "get_many_into(keys, out) -> int\n\n"
+     "Look up `keys`, writing the values as 64-bit words into the writable "
+     "buffer `out` (an array('Q'), a numpy uint64 array, SharedMemory.buf...). "
+     "Returns the number of values written. Faster than get_many() for repeated "
+     "batches: no list and no Python int is allocated per key."},
     {"to_bytes",        (PyCFunction)PyConstMap_serialize,       METH_NOARGS,
      "Serialize the map to bytes."},
     {"from_bytes",      (PyCFunction)PyConstMap_deserialize,     METH_O   | METH_CLASS,
@@ -571,90 +633,89 @@ static int PyVerifiedConstMap_contains(PyVerifiedConstMap *self, PyObject *key) 
     return v == FCM_NOT_FOUND ? 0 : 1;
 }
 
+/* Batch lookup: keys absent from the original mapping yield `default`.
+ * Keys are handed to the core in chunks so it can overlap the memory accesses
+ * of a whole block (see fcm_verified_constmap_lookup_many). */
 static PyObject *PyVerifiedConstMap_get_many(PyVerifiedConstMap *self, PyObject *args, PyObject *kwargs) {
     PyObject *arg;
     PyObject *default_ = Py_None;
     static char *kwlist[] = {"keys", "default", NULL};
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|O", kwlist, &arg, &default_)) return NULL;
 
-    if (PyList_Check(arg) || PyTuple_Check(arg)) {
-        Py_ssize_t n = PySequence_Fast_GET_SIZE(arg);
-        PyObject **items = PySequence_Fast_ITEMS(arg);
-        PyObject *out = PyList_New(n);
-        if (!out) return NULL;
-        for (Py_ssize_t i = 0; i < n; i++) {
-            PyObject *k = items[i];
-            const char *s;
-            Py_ssize_t klen;
-            if (PyUnicode_Check(k)) {
-                s = PyUnicode_AsUTF8AndSize(k, &klen);
-                if (!s) { Py_DECREF(out); return NULL; }
-            } else if (PyBytes_Check(k)) {
-                if (PyBytes_AsStringAndSize(k, (char **)&s, &klen) < 0) {
-                    Py_DECREF(out); return NULL;
-                }
-            } else {
-                Py_DECREF(out);
-                PyErr_Format(PyExc_TypeError,
-                             "keys must be str or bytes, not %s",
-                             Py_TYPE(k)->tp_name);
-                return NULL;
-            }
-            uint64_t v = fcm_verified_constmap_lookup(&self->vm, s, (size_t)klen);
-            PyObject *iv;
-            if (v == FCM_NOT_FOUND) {
-                iv = default_;
-                Py_INCREF(iv);
-            } else {
-                iv = PyLong_FromUnsignedLongLong((unsigned long long)v);
-                if (!iv) { Py_DECREF(out); return NULL; }
-            }
-            PyList_SET_ITEM(out, i, iv);
-        }
-        return out;
-    }
+    PyObject *seq = PySequence_Fast(arg, "get_many() requires an iterable of keys");
+    if (!seq) return NULL;
+    Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
+    PyObject   **items = PySequence_Fast_ITEMS(seq);
+    PyObject    *out   = PyList_New(n);
+    if (!out) { Py_DECREF(seq); return NULL; }
 
-    PyObject *it = PyObject_GetIter(arg);
-    if (!it) return NULL;
-    PyObject *out = PyList_New(0);
-    if (!out) { Py_DECREF(it); return NULL; }
-    PyObject *item;
-    while ((item = PyIter_Next(it)) != NULL) {
-        const char *s;
-        Py_ssize_t klen;
-        if (PyUnicode_Check(item)) {
-            s = PyUnicode_AsUTF8AndSize(item, &klen);
-            if (!s) { Py_DECREF(item); goto fail; }
-        } else if (PyBytes_Check(item)) {
-            if (PyBytes_AsStringAndSize(item, (char **)&s, &klen) < 0) {
-                Py_DECREF(item); goto fail;
+    fcm_key_t kbuf[FCM_PY_CHUNK];
+    uint64_t  vbuf[FCM_PY_CHUNK];
+    for (Py_ssize_t base = 0; base < n; base += FCM_PY_CHUNK) {
+        Py_ssize_t m = n - base < FCM_PY_CHUNK ? n - base : FCM_PY_CHUNK;
+        for (Py_ssize_t j = 0; j < m; j++) {
+            if (fcm_key_from_object(items[base + j], &kbuf[j]) < 0) goto fail;
+        }
+        fcm_verified_constmap_lookup_many(&self->vm, kbuf, (size_t)m, vbuf);
+        for (Py_ssize_t j = 0; j < m; j++) {
+            PyObject *iv;
+            if (vbuf[j] == FCM_NOT_FOUND) {
+                iv = Py_NewRef(default_);
+            } else {
+                iv = PyLong_FromUnsignedLongLong((unsigned long long)vbuf[j]);
+                if (!iv) goto fail;
             }
-        } else {
-            PyErr_Format(PyExc_TypeError,
-                         "keys must be str or bytes, not %s",
-                         Py_TYPE(item)->tp_name);
-            Py_DECREF(item); goto fail;
+            PyList_SET_ITEM(out, base + j, iv);
         }
-        uint64_t v = fcm_verified_constmap_lookup(&self->vm, s, (size_t)klen);
-        Py_DECREF(item);
-        PyObject *iv;
-        if (v == FCM_NOT_FOUND) {
-            iv = default_;
-            Py_INCREF(iv);
-        } else {
-            iv = PyLong_FromUnsignedLongLong((unsigned long long)v);
-            if (!iv) goto fail;
-        }
-        if (PyList_Append(out, iv) < 0) { Py_DECREF(iv); goto fail; }
-        Py_DECREF(iv);
     }
-    Py_DECREF(it);
-    if (PyErr_Occurred()) { Py_DECREF(out); return NULL; }
+    Py_DECREF(seq);
     return out;
 fail:
-    Py_DECREF(it);
+    Py_DECREF(seq);
     Py_DECREF(out);
     return NULL;
+}
+
+/* Batch lookup writing into a caller-owned buffer of 64-bit words. Keys that
+ * were not in the original mapping get NOT_FOUND (2**64 - 1) — a buffer of raw
+ * words has no room for a Python default. Returns the number of values
+ * written. */
+static PyObject *PyVerifiedConstMap_get_many_into(PyVerifiedConstMap *self, PyObject *args) {
+    PyObject *keys_arg, *out_arg;
+    if (!PyArg_ParseTuple(args, "OO:get_many_into", &keys_arg, &out_arg)) return NULL;
+
+    PyObject *seq = PySequence_Fast(keys_arg, "get_many_into() requires an iterable of keys");
+    if (!seq) return NULL;
+    Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
+    PyObject   **items = PySequence_Fast_ITEMS(seq);
+
+    Py_buffer view;
+    if (fcm_out_buffer(out_arg, n, &view) < 0) { Py_DECREF(seq); return NULL; }
+
+    int aligned = (((uintptr_t)view.buf) & 7u) == 0;
+    fcm_key_t kbuf[FCM_PY_CHUNK];
+    uint64_t  vbuf[FCM_PY_CHUNK];
+    for (Py_ssize_t base = 0; base < n; base += FCM_PY_CHUNK) {
+        Py_ssize_t m = n - base < FCM_PY_CHUNK ? n - base : FCM_PY_CHUNK;
+        for (Py_ssize_t j = 0; j < m; j++) {
+            if (fcm_key_from_object(items[base + j], &kbuf[j]) < 0) {
+                PyBuffer_Release(&view);
+                Py_DECREF(seq);
+                return NULL;
+            }
+        }
+        if (aligned) {
+            fcm_verified_constmap_lookup_many(&self->vm, kbuf, (size_t)m,
+                                              (uint64_t *)view.buf + base);
+        } else {
+            fcm_verified_constmap_lookup_many(&self->vm, kbuf, (size_t)m, vbuf);
+            memcpy((char *)view.buf + (size_t)base * sizeof(uint64_t),
+                   vbuf, (size_t)m * sizeof(uint64_t));
+        }
+    }
+    PyBuffer_Release(&view);
+    Py_DECREF(seq);
+    return PyLong_FromSsize_t(n);
 }
 
 static Py_ssize_t PyVerifiedConstMap_length(PyVerifiedConstMap *self) {
@@ -778,6 +839,11 @@ static PyMethodDef PyVerifiedConstMap_methods[] = {
      "Return value for `key`, or `default` (default None) if not present."},
     {"get_many",        (PyCFunction)(void *)PyVerifiedConstMap_get_many,          METH_VARARGS | METH_KEYWORDS,
      "Look up an iterable of keys; missing keys yield `default` (default None)."},
+    {"get_many_into",   (PyCFunction)PyVerifiedConstMap_get_many_into,             METH_VARARGS,
+     "get_many_into(keys, out) -> int\n\n"
+     "Look up `keys`, writing the values as 64-bit words into the writable "
+     "buffer `out`. Keys that are not present get NOT_FOUND (2**64 - 1). "
+     "Returns the number of values written."},
     {"to_bytes",        (PyCFunction)PyVerifiedConstMap_serialize,                 METH_NOARGS,
      "Serialize the map to bytes."},
     {"from_bytes",      (PyCFunction)PyVerifiedConstMap_deserialize,               METH_O | METH_CLASS,
@@ -849,6 +915,14 @@ PyMODINIT_FUNC PyInit__fastconstmap(void) {
     Py_INCREF(&PyVerifiedConstMapType);
     if (PyModule_AddObject(m, "VerifiedConstMap", (PyObject *)&PyVerifiedConstMapType) < 0) {
         Py_DECREF(&PyVerifiedConstMapType);
+        Py_DECREF(m);
+        return NULL;
+    }
+    /* The sentinel get_many_into() writes for a key the verified map does not
+     * hold; there is no room for a Python default in a buffer of raw words. */
+    if (PyModule_AddObject(m, "NOT_FOUND",
+                           PyLong_FromUnsignedLongLong(
+                               (unsigned long long)FCM_NOT_FOUND)) < 0) {
         Py_DECREF(m);
         return NULL;
     }
