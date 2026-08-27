@@ -26,4 +26,4 @@ copy — see ``serialized_size``, ``write_into`` and ``from_buffer``.
 from ._fastconstmap import ConstMap, VerifiedConstMap, NOT_FOUND
 
 __all__ = ["ConstMap", "VerifiedConstMap", "NOT_FOUND"]
-__version__ = "0.8.0"
+__version__ = "0.9.0"
