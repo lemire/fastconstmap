@@ -660,7 +660,8 @@ static PyObject *PyVerifiedConstMap_get_many(PyVerifiedConstMap *self, PyObject 
         for (Py_ssize_t j = 0; j < m; j++) {
             PyObject *iv;
             if (vbuf[j] == FCM_NOT_FOUND) {
-                iv = Py_NewRef(default_);
+                iv = default_;          /* Py_NewRef is 3.10+; keep 3.9 buildable */
+                Py_INCREF(iv);
             } else {
                 iv = PyLong_FromUnsignedLongLong((unsigned long long)vbuf[j]);
                 if (!iv) goto fail;
