@@ -76,6 +76,24 @@ uint64_t fcm_constmap_lookup(const fcm_constmap_t *cm,
 uint64_t fcm_verified_constmap_lookup(const fcm_verified_constmap_t *vm,
                                       const char *key, size_t key_len);
 
+/* Batched lookup: `out[i]` receives the value for `keys[i]`, exactly as the
+ * single-key lookup would return it (including FCM_NOT_FOUND for a key the
+ * verified map does not hold).
+ *
+ * These are faster than a loop over the single-key form because they hash a
+ * block of keys before gathering any values, so the array reads of a whole
+ * block are in flight at once instead of each key's loads waiting behind the
+ * hashing of the one before it. A lookup is memory-latency bound as soon as
+ * the map outgrows the last-level cache, which is where the gain comes from.
+ *
+ * `out` must have room for `n` values. `keys` and `out` may not overlap. */
+void fcm_constmap_lookup_many(const fcm_constmap_t *cm,
+                              const fcm_key_t *keys, size_t n,
+                              uint64_t *out);
+void fcm_verified_constmap_lookup_many(const fcm_verified_constmap_t *vm,
+                                       const fcm_key_t *keys, size_t n,
+                                       uint64_t *out);
+
 /* Serialisation to/from a memory buffer.
  *   *_serialized_size : exact byte count
  *   *_write           : write to `buf` (must have at least serialized_size bytes)

@@ -556,6 +556,86 @@ uint64_t fcm_verified_constmap_lookup(const fcm_verified_constmap_t *vm,
     return vm->data[h0] ^ vm->data[h1] ^ vm->data[h2];
 }
 
+/* Batched lookup.
+ *
+ * A block of keys is hashed first, then its positions are computed, then the
+ * values are gathered. Splitting the work into phases lets the array reads of
+ * a whole block overlap: with a lookup per iteration, each key's loads cannot
+ * start until the previous key's hash is finished, so the memory latency of
+ * every key is paid end to end. Eight was the best or tied-best block size of
+ * 4, 8, 16 and 32 on both an Apple M4 Max and an Intel Xeon Gold 6548N.
+ *
+ * This matches the MapMany/MapManyInto of the Go original (v1.1.0), minus its
+ * batched hash routine: that exists because Go pays a call per key and reloads
+ * the XXH64 primes each time, whereas XXH_INLINE_ALL inlines XXH3 straight
+ * into the loop below, so the compiler already hoists what is loop-invariant
+ * out of the block. */
+#ifndef FCM_BATCH_BLOCK
+#define FCM_BATCH_BLOCK 8
+#endif
+
+void fcm_constmap_lookup_many(const fcm_constmap_t *cm,
+                              const fcm_key_t *keys, size_t n,
+                              uint64_t *out) {
+    if (cm->data_len == 0) {
+        for (size_t i = 0; i < n; i++) out[i] = 0;
+        return;
+    }
+
+    const uint64_t *data = cm->data;
+    uint32_t h0[FCM_BATCH_BLOCK], h1[FCM_BATCH_BLOCK], h2[FCM_BATCH_BLOCK];
+
+    size_t i = 0;
+    for (; i + FCM_BATCH_BLOCK <= n; i += FCM_BATCH_BLOCK) {
+        for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
+            uint64_t hash = fcm_mixsplit(
+                fcm_hash_key(keys[i + j].bytes, keys[i + j].len), cm->seed);
+            fcm_get_h012(hash, cm->segment_length, cm->segment_length_mask,
+                         cm->segment_count_length, &h0[j], &h1[j], &h2[j]);
+        }
+        for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
+            out[i + j] = data[h0[j]] ^ data[h1[j]] ^ data[h2[j]];
+        }
+    }
+    /* Tail: fewer than one block left. */
+    for (; i < n; i++) {
+        out[i] = fcm_constmap_lookup(cm, keys[i].bytes, keys[i].len);
+    }
+}
+
+void fcm_verified_constmap_lookup_many(const fcm_verified_constmap_t *vm,
+                                       const fcm_key_t *keys, size_t n,
+                                       uint64_t *out) {
+    if (vm->data_len == 0) {
+        for (size_t i = 0; i < n; i++) out[i] = FCM_NOT_FOUND;
+        return;
+    }
+
+    const uint64_t *data   = vm->data;
+    const uint64_t *checks = vm->checks;
+    uint32_t h0[FCM_BATCH_BLOCK], h1[FCM_BATCH_BLOCK], h2[FCM_BATCH_BLOCK];
+    uint64_t hashes[FCM_BATCH_BLOCK];
+
+    size_t i = 0;
+    for (; i + FCM_BATCH_BLOCK <= n; i += FCM_BATCH_BLOCK) {
+        for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
+            uint64_t hash = fcm_mixsplit(
+                fcm_hash_key(keys[i + j].bytes, keys[i + j].len), vm->seed);
+            hashes[j] = hash;
+            fcm_get_h012(hash, vm->segment_length, vm->segment_length_mask,
+                         vm->segment_count_length, &h0[j], &h1[j], &h2[j]);
+        }
+        for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
+            uint64_t fp = checks[h0[j]] ^ checks[h1[j]] ^ checks[h2[j]];
+            uint64_t v  = data[h0[j]] ^ data[h1[j]] ^ data[h2[j]];
+            out[i + j] = (fp == fcm_fingerprint(hashes[j])) ? v : FCM_NOT_FOUND;
+        }
+    }
+    for (; i < n; i++) {
+        out[i] = fcm_verified_constmap_lookup(vm, keys[i].bytes, keys[i].len);
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 /* Serialisation                                                             */
 /*                                                                           */

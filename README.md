@@ -13,7 +13,8 @@ Given a `dict[str, int]` at build time, you get back a lookup object that:
 - answers a lookup in **one xxhash call plus three array reads**,
 - is **immutable** and **serializable** to bytes / a file,
 - exposes both a single-key API (`m[key]`) and a **batched** API
-  (`m.get_many([...])`) that amortises Python-C call overhead.
+  (`m.get_many([...])`, `m.get_many_into([...], buf)`) that amortises Python-C
+  call overhead and overlaps the memory accesses of a whole block of keys.
 
 This package is a C port of the Go library
 [`github.com/lemire/constmap`][constmap]. It vendors
@@ -50,6 +51,12 @@ vm.get("grape", -1)         # -> -1
 vm["grape"]                 # raises KeyError
 vm.get_many(["banana", "grape"], default=-1)  # -> [200, -1]
 
+# Batches can also be written straight into a buffer you own — no list of
+# Python ints is built.
+import array
+out = array.array("Q", [0]) * 3
+m.get_many_into(["apple", "banana", "cherry"], out)   # -> 3; out == [100, 200, 300]
+
 # Either kind can be saved and loaded.
 m.save("mymap.cmap")
 m2 = ConstMap.load("mymap.cmap")
@@ -70,6 +77,87 @@ m3 = ConstMap.from_bytes(blob)
 
 The false-positive rate of `VerifiedConstMap` (a missing key wrongly
 reported as present) is roughly 2⁻⁶⁴, which is negligible in practice.
+
+## Batched lookups
+
+`get_many` takes an iterable of keys and returns a list of values, in the same
+order:
+
+```python
+cm.get_many(["apple", "banana", "cherry"])          # -> [100, 200, 300]
+vm.get_many(["banana", "grape"], default=-1)        # -> [200, -1]
+```
+
+`get_many_into` is the same lookup writing 64-bit words into a buffer you own,
+so a repeated batch allocates nothing at all — no list, and no Python `int` per
+key. The buffer can be an `array("Q")`, a numpy `uint64` array, a
+`SharedMemory` block, or any other writable buffer of at least `8 * len(keys)`
+bytes. It returns the number of values written:
+
+```python
+import array
+out = array.array("Q", [0]) * 4096
+for batch in batches:
+    n = cm.get_many_into(batch, out)
+    use(out[:n])
+```
+
+`VerifiedConstMap.get_many_into` writes `fastconstmap.NOT_FOUND` (`2**64 - 1`)
+for a key that was not in the original mapping — a buffer of raw words has no
+room for a Python default.
+
+A batch is faster than a loop over single lookups because it hashes a block of
+eight keys before gathering any values. That lets the three array reads of all
+eight keys be in flight at once, instead of each key's loads waiting behind the
+hashing of the key before it. A lookup is memory-latency bound as soon as the
+map outgrows the last-level cache, which is where the gain comes from.
+
+### Measured
+
+At the C level, 2000-key batches against a 1,000,000-key map, ns/key, medians
+of three runs (`benchmarks/bench_batch.c`). *Cold* rotates through 64 distinct
+random batches so the cache lines the lookups touch are not already resident;
+*hot* replays one batch, so the touched region stays cache-resident and hashing
+dominates instead.
+
+| | | loop over lookup | `lookup_many` | |
+|---|---|---|---|---|
+| **Apple M4 Max** | `ConstMap` cold | 5.5 | **3.8** | 30% |
+| | `ConstMap` hot | 4.2 | **3.1** | 27% |
+| | `VerifiedConstMap` cold | 9.6 | **7.8** | 19% |
+| | `VerifiedConstMap` hot | 5.4 | **5.2** | 4% |
+| **Xeon Gold 6548N** | `ConstMap` cold | 12.6 | **10.4** | 18% |
+| | `ConstMap` hot | 6.3 | **5.0** | 21% |
+| | `VerifiedConstMap` cold | 15.9 | 16.6 | −5% |
+| | `VerifiedConstMap` hot | 7.9 | **6.7** | 15% |
+
+The one case where batching does not pay is `VerifiedConstMap` in the cold
+regime on the Xeon. That map probes two arrays per lookup, so a fresh batch is
+bound by a memory latency the overlapping cannot hide. The Go original reports
+the same result on the same processor.
+
+Through the Python API, ns/key on the same batches — 0.8.0 is the previous
+per-key loop, 0.9.0 the batched path:
+
+| | | 0.8.0 | 0.9.0 | `get_many_into` |
+|---|---|---|---|---|
+| **Apple M4 Max** | `ConstMap` cold | 30.7 | **20.6** | **14.2** |
+| | `ConstMap` hot | 16.4 | **14.1** | **6.1** |
+| | `VerifiedConstMap` cold | 35.5 | 35.3 | **23.9** |
+| **Xeon Gold 6548N** | `ConstMap` cold | 34.9 | **25.5** | **16.5** |
+| | `ConstMap` hot | 18.7 | **17.2** | **8.8** |
+| | `VerifiedConstMap` cold | 37.6 | **31.9** | **23.3** |
+
+What is left in the `get_many` column is the cost of boxing each value in a
+Python `int` and building the list, which is why `get_many_into` — which does
+neither — is another 30-60% faster again.
+
+To reproduce:
+
+```
+cc -O3 -std=c11 -Isrc benchmarks/bench_batch.c src/constmap.c -lm -o bench_batch
+./bench_batch 1000000
+```
 
 ## Keys and values
 
@@ -158,41 +246,46 @@ its memory independently of the source buffer.
 
 ## Benchmark
 
-On an Apple M-series CPU, with 1,000,000 string keys
-(`key-{i}-{hex}` shaped strings):
+On an Apple M4 Max, with 1,000,000 string keys (`key-{i}-{hex}` shaped
+strings). Lookups query every key exactly once, in random order, from a list
+built in that order:
 
 ```
-=== fastconstmap benchmark — n = 1,000,000 keys, python 3.14.3 ===
+=== fastconstmap benchmark — n = 1,000,000 keys, python 3.14.5 ===
 
 Construction:
-  ConstMap.__init__                0.145 s
-  VerifiedConstMap.__init__        0.129 s
-  dict(d)                          0.005 s
+  ConstMap.__init__                       0.145 s
+  VerifiedConstMap.__init__               0.142 s
+  dict(d)                                 0.004 s
 
 Memory:
-  ConstMap.nbytes                 9,043,968 bytes  (9.04 bytes/key)
-  VerifiedConstMap.nbytes        18,087,936 bytes  (18.09 bytes/key)
-  dict (table+keys+values)      118,380,958 bytes  (118.38 bytes/key)
-  ratio dict / ConstMap          13.1x
+  ConstMap.nbytes                           9,043,968 bytes  (9.04 bytes/key)
+  VerifiedConstMap.nbytes                  18,087,936 bytes  (18.09 bytes/key)
+  dict (table+keys+values)                118,380,958 bytes  (118.38 bytes/key)
+  ratio dict / ConstMap                  13.1x
 
+Single lookup, every key once in random order (1,000,000 ops):
+  dict[k]                                   336.1 ns/op  (0.336 s total)
+  ConstMap[k]                                95.2 ns/op  (0.095 s total)
+  VerifiedConstMap[k]                       112.3 ns/op  (0.112 s total)
 
-Single lookup, 2,000,000 ops:
-  dict[k]                         397.7 ns/op  (0.795 s total)
-  ConstMap[k]                     179.3 ns/op  (0.359 s total)
-  VerifiedConstMap[k]             213.2 ns/op  (0.426 s total)
-
-Batched lookup, 2000 × 1024:
-  dict comprehension               31.9 ns/op  (0.03 ms/batch of 1024)
-  ConstMap.get_many                14.6 ns/op  (0.01 ms/batch of 1024)
-  VerifiedConstMap.get_many        16.5 ns/op  (0.02 ms/batch of 1024)
+Batched lookup, 2000 × 2000:
+  dict comprehension (cold)                 148.7 ns/op  (0.30 ms/batch of 2000)
+  ConstMap.get_many (cold)                   24.2 ns/op  (0.05 ms/batch of 2000)
+  ConstMap.get_many (hot)                    15.6 ns/op  (0.03 ms/batch of 2000)
+  ConstMap.get_many_into (cold)              14.2 ns/op  (0.03 ms/batch of 2000)
+  ConstMap.get_many_into (hot)                6.1 ns/op  (0.01 ms/batch of 2000)
+  VerifiedConstMap.get_many (cold)           33.7 ns/op  (0.07 ms/batch of 2000)
+  VerifiedConstMap.get_many_into (cold)      23.9 ns/op  (0.05 ms/batch of 2000)
 
 Serialization:
-  ConstMap.to_bytes                0.009 s  (9,044,004 bytes)
-  ConstMap.from_bytes              0.009 s
+  ConstMap.to_bytes                       0.010 s  (9,044,008 bytes)
+  ConstMap.from_bytes                     0.010 s
 ```
 
-For better performance use `get_many` when you have an array of keys to look
-up at once.
+The single-lookup numbers are dominated by Python call overhead, not by the
+map: use `get_many` when you have an array of keys to look up at once, and
+`get_many_into` when you have somewhere to put the results.
 
 To reproduce:
 
