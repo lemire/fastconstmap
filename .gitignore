@@ -14,3 +14,5 @@ dist/
 .mypy_cache/
 .ipynb_checkpoints/
 *.cmap
+# ...except the cross-implementation fixtures the tests load.
+!tests/interop/*.cmap
