@@ -113,13 +113,17 @@ int main(int argc, char **argv) {
     if (!values) { fprintf(stderr, "oom\n"); return 1; }
     for (size_t i = 0; i < map_n; i++) values[i] = i;
 
-    fcm_constmap_t          cm;
-    fcm_verified_constmap_t vm;
+    fcm_constmap_t                 cm;
+    fcm_verified_constmap_t        vm;
+    fcm_paired_verified_constmap_t pm;
     if (fcm_constmap_new(&cm, all.keys, values, map_n) != FCM_OK) {
         fprintf(stderr, "construction failed\n"); return 1;
     }
     if (fcm_verified_constmap_new(&vm, all.keys, values, map_n) != FCM_OK) {
         fprintf(stderr, "verified construction failed\n"); return 1;
+    }
+    if (fcm_paired_verified_constmap_new(&pm, all.keys, values, map_n) != FCM_OK) {
+        fprintf(stderr, "paired construction failed\n"); return 1;
     }
 
     keyset_t pools[NUM_POOLS];
@@ -215,11 +219,51 @@ int main(int argc, char **argv) {
     report("lookup_many (hot)", now_sec() - t0, total,
            loop_ns * 1e9 / (double)total);
 
+    /* ---- PairedVerifiedConstMap, cold ---- */
+    printf("\nPairedVerifiedConstMap:\n");
+    t0 = now_sec();
+    for (int i = 0; i < REPEATS; i++) {
+        const keyset_t *q = &pools[i % NUM_POOLS];
+        for (size_t j = 0; j < q->n; j++)
+            out[j] = fcm_paired_verified_constmap_lookup(&pm, q->keys[j].bytes, q->keys[j].len);
+        sink = out[0];
+    }
+    loop_ns = now_sec() - t0;
+    report("loop over lookup (cold)", loop_ns, total, 0.0);
+
+    t0 = now_sec();
+    for (int i = 0; i < REPEATS; i++) {
+        const keyset_t *q = &pools[i % NUM_POOLS];
+        fcm_paired_verified_constmap_lookup_many(&pm, q->keys, q->n, out);
+        sink = out[0];
+    }
+    report("lookup_many (cold)", now_sec() - t0, total,
+           loop_ns * 1e9 / (double)total);
+
+    /* ---- PairedVerifiedConstMap, hot ---- */
+    t0 = now_sec();
+    for (int i = 0; i < REPEATS; i++) {
+        for (size_t j = 0; j < hot->n; j++)
+            out[j] = fcm_paired_verified_constmap_lookup(&pm, hot->keys[j].bytes, hot->keys[j].len);
+        sink = out[0];
+    }
+    loop_ns = now_sec() - t0;
+    report("loop over lookup (hot)", loop_ns, total, 0.0);
+
+    t0 = now_sec();
+    for (int i = 0; i < REPEATS; i++) {
+        fcm_paired_verified_constmap_lookup_many(&pm, hot->keys, hot->n, out);
+        sink = out[0];
+    }
+    report("lookup_many (hot)", now_sec() - t0, total,
+           loop_ns * 1e9 / (double)total);
+
     for (int p = 0; p < NUM_POOLS; p++) keyset_free(&pools[p]);
     keyset_free(&all);
     free(values);
     free(out);
     fcm_constmap_free(&cm);
     fcm_verified_constmap_free(&vm);
+    fcm_paired_verified_constmap_free(&pm);
     return 0;
 }

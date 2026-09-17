@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from fastconstmap import ConstMap, VerifiedConstMap
+from fastconstmap import ConstMap, PairedVerifiedConstMap, VerifiedConstMap
 
 
 # --------------------------------------------------------------------------
@@ -80,13 +80,67 @@ def test_from_buffer_on_bytes():
         assert view[k] == v
 
 
-def test_from_buffer_unaligned_rejected():
-    cm = ConstMap({"a": 1, "b": 2, "c": 3})
-    blob = cm.to_bytes()
+@pytest.mark.parametrize("Map", [ConstMap, VerifiedConstMap, PairedVerifiedConstMap])
+def test_from_buffer_unaligned_rejected(Map):
+    m = Map({"a": 1, "b": 2, "c": 3})
+    blob = m.to_bytes()
     # Offsetting by one byte makes the embedded uint64 array unaligned.
     padded = memoryview(bytearray(b"\x00" + blob))[1:]
     with pytest.raises(ValueError):
-        ConstMap.from_buffer(padded)
+        Map.from_buffer(padded)
+
+
+def test_paired_from_buffer_eight_byte_aligned():
+    """The zero-copy contract is 8-byte alignment. A paired slot is 16 bytes
+    and is read with unaligned vector loads, so a buffer that is 8-byte but
+    not 16-byte aligned must work, just with each slot possibly straddling
+    two cache lines."""
+    import ctypes
+
+    d = {f"k{i}": i for i in range(3000)}
+    pm = PairedVerifiedConstMap(d)
+    blob = pm.to_bytes()
+    backing = bytearray(16 + len(blob))
+    # Place the payload at the offset within the first 16 bytes at which its
+    # address is 8 mod 16, using the buffer's real address.
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(backing))
+    off = next(o for o in range(16) if (addr + o) % 16 == 8)
+    backing[off:off + len(blob)] = blob
+    view = PairedVerifiedConstMap.from_buffer(memoryview(backing)[off:off + len(blob)])
+    for k, v in d.items():
+        assert view[k] == v
+    assert view.get("absent") is None
+    assert view.get_many(list(d)[:100]) == list(range(100))
+    del view
+
+
+def test_paired_from_bytes_rejects_inconsistent_parameters():
+    """A checksum-valid paired file whose segment parameters do not describe
+    its slot count is refused: lookups index the slots without bounds checks
+    and trust those parameters."""
+    import struct
+    pm = PairedVerifiedConstMap({f"k{i}": i for i in range(1000)})
+    blob = bytearray(pm.to_bytes())
+    seg_len, seg_count, slots = struct.unpack_from("<III", blob, 16)
+    assert (seg_count + 2) * seg_len == slots
+
+    def with_header(seg_len, seg_count):
+        bad = bytearray(blob)
+        struct.pack_into("<II", bad, 16, seg_len, seg_count)
+        # Recompute the FNV-1a trailer so only the parameter check can fire.
+        h = 0xCBF29CE484222325
+        for b in bad[:-8]:
+            h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+        struct.pack_into("<Q", bad, len(bad) - 8, h)
+        return bytes(bad)
+
+    # The intact bytes round-trip, so the rewrite itself is sound.
+    assert PairedVerifiedConstMap.from_bytes(with_header(seg_len, seg_count))["k7"] == 7
+    for bad_len, bad_count in [(seg_len, 2 * seg_count), (3, seg_count), (slots // 2, 0)]:
+        with pytest.raises(ValueError, match="segment parameters"):
+            PairedVerifiedConstMap.from_bytes(with_header(bad_len, bad_count))
+        with pytest.raises(ValueError, match="segment parameters"):
+            PairedVerifiedConstMap.from_buffer(with_header(bad_len, bad_count))
 
 
 def test_from_buffer_bad_magic():
@@ -102,12 +156,13 @@ def test_from_buffer_corrupted_checksum():
         ConstMap.from_buffer(buf)
 
 
-def test_verified_write_into_from_buffer():
+@pytest.mark.parametrize("Verified", [VerifiedConstMap, PairedVerifiedConstMap])
+def test_verified_write_into_from_buffer(Verified):
     d = {f"k{i}": i for i in range(1500)}
-    vm = VerifiedConstMap(d)
+    vm = Verified(d)
     buf = bytearray(vm.serialized_size())
     vm.write_into(buf)
-    view = VerifiedConstMap.from_buffer(buf)
+    view = Verified.from_buffer(buf)
     for k, v in d.items():
         assert view[k] == v
     assert view.get("not-present") is None

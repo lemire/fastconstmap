@@ -1,6 +1,7 @@
 /*
  * fastconstmap — Python C extension
- * Exposes ConstMap and VerifiedConstMap built from a {str: int} dict.
+ * Exposes ConstMap, VerifiedConstMap and PairedVerifiedConstMap built from a
+ * {str: int} dict.
  *
  * Apache License 2.0
  */
@@ -64,6 +65,21 @@ static int fcm_out_buffer(PyObject *obj, Py_ssize_t n, Py_buffer *view) {
 /* Error helpers                                                             */
 /* ------------------------------------------------------------------------- */
 
+/* Parses the `hash` keyword of the constructors: "xxh64" (the default, the
+ * hash shared with the Go and Rust implementations) or "xxh3" (faster on
+ * short keys, files readable by fastconstmap only). Returns -1 with a Python
+ * error set on anything else. */
+static int fcm_parse_hash(const char *name, uint32_t *hash) {
+    if (name == NULL || strcmp(name, "xxh64") == 0) { *hash = FCM_HASH_XXH64; return 0; }
+    if (strcmp(name, "xxh3") == 0)                  { *hash = FCM_HASH_XXH3;  return 0; }
+    PyErr_Format(PyExc_ValueError, "hash must be \"xxh64\" or \"xxh3\", not \"%s\"", name);
+    return -1;
+}
+
+static PyObject *fcm_hash_name(uint32_t hash) {
+    return PyUnicode_FromString(hash == FCM_HASH_XXH3 ? "xxh3" : "xxh64");
+}
+
 static void fcm_set_python_error(int rc) {
     switch (rc) {
     case FCM_E_LENGTH_MISMATCH:
@@ -88,6 +104,10 @@ static void fcm_set_python_error(int rc) {
         break;
     case FCM_E_SHORT_BUFFER:
         PyErr_SetString(PyExc_ValueError, "serialized data is truncated");
+        break;
+    case FCM_E_INVALID_PARAMS:
+        PyErr_SetString(PyExc_ValueError,
+                        "invalid serialized data (segment parameters do not describe the slot count)");
         break;
     default:
         PyErr_Format(PyExc_RuntimeError, "fastconstmap error %d", rc);
@@ -219,8 +239,11 @@ static void pyconstmap_release(PyConstMap *self) {
 
 static int PyConstMap_init(PyConstMap *self, PyObject *args, PyObject *kwargs) {
     PyObject *dict;
-    static char *kwlist[] = {"mapping", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", kwlist, &dict)) return -1;
+    const char *hash_name = NULL;
+    static char *kwlist[] = {"mapping", "hash", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|s", kwlist, &dict, &hash_name)) return -1;
+    uint32_t hash;
+    if (fcm_parse_hash(hash_name, &hash) < 0) return -1;
 
     size_t     n = 0;
     fcm_key_t *keys = NULL;
@@ -232,7 +255,7 @@ static int PyConstMap_init(PyConstMap *self, PyObject *args, PyObject *kwargs) {
 
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = fcm_constmap_new(&self->cm, keys, vals, n);
+    rc = fcm_constmap_new_with_hash(&self->cm, keys, vals, n, hash);
     Py_END_ALLOW_THREADS
 
     PyMem_Free(keys);
@@ -508,6 +531,17 @@ static PyMethodDef PyConstMap_methods[] = {
     {NULL, NULL, 0, NULL}
 };
 
+static PyObject *PyConstMap_get_hash(PyConstMap *self, void *Py_UNUSED(closure)) {
+    return fcm_hash_name(self->cm.hash);
+}
+
+static PyGetSetDef PyConstMap_getset[] = {
+    {"hash", (getter)PyConstMap_get_hash, NULL,
+     "The key hash this map was built with: \"xxh64\" (shared with the Go and Rust "
+     "implementations) or \"xxh3\" (fastconstmap only).", NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
 static PyMappingMethods PyConstMap_as_mapping = {
     (lenfunc)PyConstMap_length,
     (binaryfunc)PyConstMap_subscript,
@@ -523,6 +557,7 @@ static PyTypeObject PyConstMapType = {
     .tp_flags     = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     .tp_doc       = "Immutable map from strings to uint64. Returns undefined values for missing keys.",
     .tp_methods   = PyConstMap_methods,
+    .tp_getset    = PyConstMap_getset,
     .tp_init      = (initproc)PyConstMap_init,
     .tp_new       = PyType_GenericNew,
 };
@@ -549,8 +584,11 @@ static void pyverified_release(PyVerifiedConstMap *self) {
 
 static int PyVerifiedConstMap_init(PyVerifiedConstMap *self, PyObject *args, PyObject *kwargs) {
     PyObject *dict;
-    static char *kwlist[] = {"mapping", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", kwlist, &dict)) return -1;
+    const char *hash_name = NULL;
+    static char *kwlist[] = {"mapping", "hash", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|s", kwlist, &dict, &hash_name)) return -1;
+    uint32_t hash;
+    if (fcm_parse_hash(hash_name, &hash) < 0) return -1;
 
     size_t     n = 0;
     fcm_key_t *keys = NULL;
@@ -562,7 +600,7 @@ static int PyVerifiedConstMap_init(PyVerifiedConstMap *self, PyObject *args, PyO
 
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = fcm_verified_constmap_new(&self->vm, keys, vals, n);
+    rc = fcm_verified_constmap_new_with_hash(&self->vm, keys, vals, n, hash);
     Py_END_ALLOW_THREADS
 
     PyMem_Free(keys);
@@ -865,6 +903,17 @@ static PyMethodDef PyVerifiedConstMap_methods[] = {
     {NULL, NULL, 0, NULL}
 };
 
+static PyObject *PyVerifiedConstMap_get_hash(PyVerifiedConstMap *self, void *Py_UNUSED(closure)) {
+    return fcm_hash_name(self->vm.hash);
+}
+
+static PyGetSetDef PyVerifiedConstMap_getset[] = {
+    {"hash", (getter)PyVerifiedConstMap_get_hash, NULL,
+     "The key hash this map was built with: \"xxh64\" (shared with the Go and Rust "
+     "implementations) or \"xxh3\" (fastconstmap only).", NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
 static PyMappingMethods PyVerifiedConstMap_as_mapping = {
     (lenfunc)PyVerifiedConstMap_length,
     (binaryfunc)PyVerifiedConstMap_subscript,
@@ -885,7 +934,385 @@ static PyTypeObject PyVerifiedConstMapType = {
     .tp_flags       = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     .tp_doc         = "Immutable map from strings to uint64. Detects keys not in the original mapping.",
     .tp_methods     = PyVerifiedConstMap_methods,
+    .tp_getset      = PyVerifiedConstMap_getset,
     .tp_init        = (initproc)PyVerifiedConstMap_init,
+    .tp_new         = PyType_GenericNew,
+};
+
+/* ------------------------------------------------------------------------- */
+/* PairedVerifiedConstMap type                                               */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    PyObject_HEAD
+    fcm_paired_verified_constmap_t vm;
+    /* Non-NULL view.obj => zero-copy view: slots point into the buffer. */
+    Py_buffer view;
+} PyPairedVerifiedConstMap;
+
+static void pypaired_release(PyPairedVerifiedConstMap *self) {
+    if (self->view.obj != NULL) {
+        PyBuffer_Release(&self->view);
+        self->vm.slots = NULL;
+    }
+    fcm_paired_verified_constmap_free(&self->vm);
+}
+
+static int PyPairedVerifiedConstMap_init(PyPairedVerifiedConstMap *self, PyObject *args, PyObject *kwargs) {
+    PyObject *dict;
+    const char *hash_name = NULL;
+    static char *kwlist[] = {"mapping", "hash", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|s", kwlist, &dict, &hash_name)) return -1;
+    uint32_t hash;
+    if (fcm_parse_hash(hash_name, &hash) < 0) return -1;
+
+    size_t     n = 0;
+    fcm_key_t *keys = NULL;
+    uint64_t  *vals = NULL;
+    PyObject  *keep = NULL;
+    if (fcm_dict_to_arrays(dict, &n, &keys, &vals, &keep) < 0) return -1;
+
+    pypaired_release(self);
+
+    int rc;
+    Py_BEGIN_ALLOW_THREADS
+    rc = fcm_paired_verified_constmap_new_with_hash(&self->vm, keys, vals, n, hash);
+    Py_END_ALLOW_THREADS
+
+    PyMem_Free(keys);
+    PyMem_Free(vals);
+    Py_DECREF(keep);
+
+    if (rc != FCM_OK) { fcm_set_python_error(rc); return -1; }
+    return 0;
+}
+
+static void PyPairedVerifiedConstMap_dealloc(PyPairedVerifiedConstMap *self) {
+    pypaired_release(self);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+/* Returns None for missing keys. */
+static PyObject *PyPairedVerifiedConstMap_get(PyPairedVerifiedConstMap *self, PyObject *args) {
+    PyObject *key;
+    PyObject *default_ = Py_None;
+    if (!PyArg_ParseTuple(args, "O|O", &key, &default_)) return NULL;
+    const char *s;
+    Py_ssize_t  n;
+    if (PyUnicode_Check(key)) {
+        s = PyUnicode_AsUTF8AndSize(key, &n);
+        if (!s) return NULL;
+    } else if (PyBytes_Check(key)) {
+        if (PyBytes_AsStringAndSize(key, (char **)&s, &n) < 0) return NULL;
+    } else {
+        PyErr_Format(PyExc_TypeError, "key must be str or bytes, not %s",
+                     Py_TYPE(key)->tp_name);
+        return NULL;
+    }
+    uint64_t v = fcm_paired_verified_constmap_lookup(&self->vm, s, (size_t)n);
+    if (v == FCM_NOT_FOUND) { Py_INCREF(default_); return default_; }
+    return PyLong_FromUnsignedLongLong((unsigned long long)v);
+}
+
+static PyObject *PyPairedVerifiedConstMap_subscript(PyPairedVerifiedConstMap *self, PyObject *key) {
+    const char *s;
+    Py_ssize_t  n;
+    if (PyUnicode_Check(key)) {
+        s = PyUnicode_AsUTF8AndSize(key, &n);
+        if (!s) return NULL;
+    } else if (PyBytes_Check(key)) {
+        if (PyBytes_AsStringAndSize(key, (char **)&s, &n) < 0) return NULL;
+    } else {
+        PyErr_Format(PyExc_TypeError, "key must be str or bytes, not %s",
+                     Py_TYPE(key)->tp_name);
+        return NULL;
+    }
+    uint64_t v = fcm_paired_verified_constmap_lookup(&self->vm, s, (size_t)n);
+    if (v == FCM_NOT_FOUND) { PyErr_SetObject(PyExc_KeyError, key); return NULL; }
+    return PyLong_FromUnsignedLongLong((unsigned long long)v);
+}
+
+static int PyPairedVerifiedConstMap_contains(PyPairedVerifiedConstMap *self, PyObject *key) {
+    const char *s;
+    Py_ssize_t  n;
+    if (PyUnicode_Check(key)) {
+        s = PyUnicode_AsUTF8AndSize(key, &n);
+        if (!s) return -1;
+    } else if (PyBytes_Check(key)) {
+        if (PyBytes_AsStringAndSize(key, (char **)&s, &n) < 0) return -1;
+    } else {
+        return 0;  /* non-str/bytes keys are not in the map */
+    }
+    uint64_t v = fcm_paired_verified_constmap_lookup(&self->vm, s, (size_t)n);
+    return v == FCM_NOT_FOUND ? 0 : 1;
+}
+
+/* Batch lookup: keys absent from the original mapping yield `default`.
+ * Keys are handed to the core in chunks so it can overlap the memory accesses
+ * of a whole block (see fcm_paired_verified_constmap_lookup_many). */
+static PyObject *PyPairedVerifiedConstMap_get_many(PyPairedVerifiedConstMap *self, PyObject *args, PyObject *kwargs) {
+    PyObject *arg;
+    PyObject *default_ = Py_None;
+    static char *kwlist[] = {"keys", "default", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|O", kwlist, &arg, &default_)) return NULL;
+
+    PyObject *seq = PySequence_Fast(arg, "get_many() requires an iterable of keys");
+    if (!seq) return NULL;
+    Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
+    PyObject   **items = PySequence_Fast_ITEMS(seq);
+    PyObject    *out   = PyList_New(n);
+    if (!out) { Py_DECREF(seq); return NULL; }
+
+    fcm_key_t kbuf[FCM_PY_CHUNK];
+    uint64_t  vbuf[FCM_PY_CHUNK];
+    for (Py_ssize_t base = 0; base < n; base += FCM_PY_CHUNK) {
+        Py_ssize_t m = n - base < FCM_PY_CHUNK ? n - base : FCM_PY_CHUNK;
+        for (Py_ssize_t j = 0; j < m; j++) {
+            if (fcm_key_from_object(items[base + j], &kbuf[j]) < 0) goto fail;
+        }
+        fcm_paired_verified_constmap_lookup_many(&self->vm, kbuf, (size_t)m, vbuf);
+        for (Py_ssize_t j = 0; j < m; j++) {
+            PyObject *iv;
+            if (vbuf[j] == FCM_NOT_FOUND) {
+                iv = default_;          /* Py_NewRef is 3.10+; keep 3.9 buildable */
+                Py_INCREF(iv);
+            } else {
+                iv = PyLong_FromUnsignedLongLong((unsigned long long)vbuf[j]);
+                if (!iv) goto fail;
+            }
+            PyList_SET_ITEM(out, base + j, iv);
+        }
+    }
+    Py_DECREF(seq);
+    return out;
+fail:
+    Py_DECREF(seq);
+    Py_DECREF(out);
+    return NULL;
+}
+
+/* Batch lookup writing into a caller-owned buffer of 64-bit words. Keys that
+ * were not in the original mapping get NOT_FOUND (2**64 - 1) — a buffer of raw
+ * words has no room for a Python default. Returns the number of values
+ * written. */
+static PyObject *PyPairedVerifiedConstMap_get_many_into(PyPairedVerifiedConstMap *self, PyObject *args) {
+    PyObject *keys_arg, *out_arg;
+    if (!PyArg_ParseTuple(args, "OO:get_many_into", &keys_arg, &out_arg)) return NULL;
+
+    PyObject *seq = PySequence_Fast(keys_arg, "get_many_into() requires an iterable of keys");
+    if (!seq) return NULL;
+    Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
+    PyObject   **items = PySequence_Fast_ITEMS(seq);
+
+    Py_buffer view;
+    if (fcm_out_buffer(out_arg, n, &view) < 0) { Py_DECREF(seq); return NULL; }
+
+    int aligned = (((uintptr_t)view.buf) & 7u) == 0;
+    fcm_key_t kbuf[FCM_PY_CHUNK];
+    uint64_t  vbuf[FCM_PY_CHUNK];
+    for (Py_ssize_t base = 0; base < n; base += FCM_PY_CHUNK) {
+        Py_ssize_t m = n - base < FCM_PY_CHUNK ? n - base : FCM_PY_CHUNK;
+        for (Py_ssize_t j = 0; j < m; j++) {
+            if (fcm_key_from_object(items[base + j], &kbuf[j]) < 0) {
+                PyBuffer_Release(&view);
+                Py_DECREF(seq);
+                return NULL;
+            }
+        }
+        if (aligned) {
+            fcm_paired_verified_constmap_lookup_many(&self->vm, kbuf, (size_t)m,
+                                              (uint64_t *)view.buf + base);
+        } else {
+            fcm_paired_verified_constmap_lookup_many(&self->vm, kbuf, (size_t)m, vbuf);
+            memcpy((char *)view.buf + (size_t)base * sizeof(uint64_t),
+                   vbuf, (size_t)m * sizeof(uint64_t));
+        }
+    }
+    PyBuffer_Release(&view);
+    Py_DECREF(seq);
+    return PyLong_FromSsize_t(n);
+}
+
+static Py_ssize_t PyPairedVerifiedConstMap_length(PyPairedVerifiedConstMap *self) {
+    return (Py_ssize_t)self->vm.n;
+}
+
+static PyObject *PyPairedVerifiedConstMap_serialize(PyPairedVerifiedConstMap *self, PyObject *Py_UNUSED(ignored)) {
+    size_t sz = fcm_paired_verified_constmap_serialized_size(&self->vm);
+    PyObject *out = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)sz);
+    if (!out) return NULL;
+    fcm_paired_verified_constmap_write(&self->vm, PyBytes_AsString(out));
+    return out;
+}
+
+static PyObject *PyPairedVerifiedConstMap_deserialize(PyTypeObject *type, PyObject *arg) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(arg, &view, PyBUF_SIMPLE) < 0) return NULL;
+    PyPairedVerifiedConstMap *self = (PyPairedVerifiedConstMap *)type->tp_alloc(type, 0);
+    if (!self) { PyBuffer_Release(&view); return NULL; }
+    memset(&self->vm, 0, sizeof(self->vm));
+    int rc = fcm_paired_verified_constmap_read(&self->vm, view.buf, (size_t)view.len);
+    PyBuffer_Release(&view);
+    if (rc != FCM_OK) { Py_DECREF(self); fcm_set_python_error(rc); return NULL; }
+    return (PyObject *)self;
+}
+
+static PyObject *PyPairedVerifiedConstMap_save(PyPairedVerifiedConstMap *self, PyObject *arg) {
+    PyObject *path = PyOS_FSPath(arg);
+    if (!path) return NULL;
+    const char *fname = PyUnicode_AsUTF8(path);
+    if (!fname) { Py_DECREF(path); return NULL; }
+    FILE *f = fopen(fname, "wb");
+    if (!f) { Py_DECREF(path); PyErr_SetFromErrnoWithFilenameObject(PyExc_OSError, path); return NULL; }
+    Py_DECREF(path);
+    size_t sz = fcm_paired_verified_constmap_serialized_size(&self->vm);
+    void *buf = PyMem_Malloc(sz);
+    if (!buf) { fclose(f); PyErr_NoMemory(); return NULL; }
+    fcm_paired_verified_constmap_write(&self->vm, buf);
+    size_t w = fwrite(buf, 1, sz, f);
+    PyMem_Free(buf);
+    int err = ferror(f);
+    fclose(f);
+    if (w != sz || err) { PyErr_SetString(PyExc_OSError, "short write"); return NULL; }
+    Py_RETURN_NONE;
+}
+
+static PyObject *PyPairedVerifiedConstMap_load(PyTypeObject *type, PyObject *arg) {
+    PyObject *path = PyOS_FSPath(arg);
+    if (!path) return NULL;
+    const char *fname = PyUnicode_AsUTF8(path);
+    if (!fname) { Py_DECREF(path); return NULL; }
+    FILE *f = fopen(fname, "rb");
+    if (!f) { PyErr_SetFromErrnoWithFilenameObject(PyExc_OSError, path); Py_DECREF(path); return NULL; }
+    Py_DECREF(path);
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0) { fclose(f); PyErr_SetString(PyExc_ValueError, "empty file"); return NULL; }
+    void *buf = PyMem_Malloc((size_t)len);
+    if (!buf) { fclose(f); PyErr_NoMemory(); return NULL; }
+    size_t r = fread(buf, 1, (size_t)len, f);
+    fclose(f);
+    if (r != (size_t)len) { PyMem_Free(buf); PyErr_SetString(PyExc_OSError, "short read"); return NULL; }
+    PyPairedVerifiedConstMap *self = (PyPairedVerifiedConstMap *)type->tp_alloc(type, 0);
+    if (!self) { PyMem_Free(buf); return NULL; }
+    memset(&self->vm, 0, sizeof(self->vm));
+    int rc = fcm_paired_verified_constmap_read(&self->vm, buf, (size_t)len);
+    PyMem_Free(buf);
+    if (rc != FCM_OK) { Py_DECREF(self); fcm_set_python_error(rc); return NULL; }
+    return (PyObject *)self;
+}
+
+static PyObject *PyPairedVerifiedConstMap_nbytes(PyPairedVerifiedConstMap *self, PyObject *Py_UNUSED(ignored)) {
+    return PyLong_FromUnsignedLongLong((unsigned long long)self->vm.data_len * 16ULL);
+}
+
+static PyObject *PyPairedVerifiedConstMap_serialized_size(PyPairedVerifiedConstMap *self, PyObject *Py_UNUSED(ignored)) {
+    return PyLong_FromSize_t(fcm_paired_verified_constmap_serialized_size(&self->vm));
+}
+
+static PyObject *PyPairedVerifiedConstMap_write_into(PyPairedVerifiedConstMap *self, PyObject *arg) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(arg, &view, PyBUF_WRITABLE) < 0) return NULL;
+    size_t need = fcm_paired_verified_constmap_serialized_size(&self->vm);
+    if (view.len < 0 || (size_t)view.len < need) {
+        PyErr_Format(PyExc_ValueError,
+                     "buffer too small: need %zu bytes, got %zd",
+                     need, view.len);
+        PyBuffer_Release(&view);
+        return NULL;
+    }
+    fcm_paired_verified_constmap_write(&self->vm, view.buf);
+    PyBuffer_Release(&view);
+    return PyLong_FromSize_t(need);
+}
+
+static PyObject *PyPairedVerifiedConstMap_from_buffer(PyTypeObject *type, PyObject *arg) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(arg, &view, PyBUF_SIMPLE) < 0) return NULL;
+    PyPairedVerifiedConstMap *self = (PyPairedVerifiedConstMap *)type->tp_alloc(type, 0);
+    if (!self) { PyBuffer_Release(&view); return NULL; }
+    int rc = fcm_paired_verified_constmap_view(&self->vm, view.buf, (size_t)view.len);
+    if (rc != FCM_OK) {
+        PyBuffer_Release(&view);
+        Py_DECREF(self);
+        if (rc == FCM_E_UNALIGNED) {
+            PyErr_SetString(PyExc_ValueError,
+                "buffer is not 8-byte aligned; cannot create a zero-copy view "
+                "(use from_bytes() to copy instead)");
+        } else {
+            fcm_set_python_error(rc);
+        }
+        return NULL;
+    }
+    self->view = view;
+    return (PyObject *)self;
+}
+
+static PyMethodDef PyPairedVerifiedConstMap_methods[] = {
+    {"get",             (PyCFunction)PyPairedVerifiedConstMap_get,                       METH_VARARGS,
+     "Return value for `key`, or `default` (default None) if not present."},
+    {"get_many",        (PyCFunction)(void *)PyPairedVerifiedConstMap_get_many,          METH_VARARGS | METH_KEYWORDS,
+     "Look up an iterable of keys; missing keys yield `default` (default None)."},
+    {"get_many_into",   (PyCFunction)PyPairedVerifiedConstMap_get_many_into,             METH_VARARGS,
+     "get_many_into(keys, out) -> int\n\n"
+     "Look up `keys`, writing the values as 64-bit words into the writable "
+     "buffer `out`. Keys that are not present get NOT_FOUND (2**64 - 1). "
+     "Returns the number of values written."},
+    {"to_bytes",        (PyCFunction)PyPairedVerifiedConstMap_serialize,                 METH_NOARGS,
+     "Serialize the map to bytes."},
+    {"from_bytes",      (PyCFunction)PyPairedVerifiedConstMap_deserialize,               METH_O | METH_CLASS,
+     "Deserialize a map from a bytes-like object (copies the data)."},
+    {"serialized_size", (PyCFunction)PyPairedVerifiedConstMap_serialized_size,           METH_NOARGS,
+     "Number of bytes that to_bytes()/write_into() will produce."},
+    {"write_into",      (PyCFunction)PyPairedVerifiedConstMap_write_into,                METH_O,
+     "Serialize directly into a writable buffer (e.g. SharedMemory.buf). Returns bytes written."},
+    {"from_buffer",     (PyCFunction)PyPairedVerifiedConstMap_from_buffer,               METH_O | METH_CLASS,
+     "Create a zero-copy map that reads directly from a buffer (e.g. shared memory). "
+     "The buffer is kept alive by the returned map and must not be modified while in use."},
+    {"save",            (PyCFunction)PyPairedVerifiedConstMap_save,                      METH_O,
+     "Save the map to a file path."},
+    {"load",            (PyCFunction)PyPairedVerifiedConstMap_load,                      METH_O | METH_CLASS,
+     "Load a map from a file path."},
+    {"nbytes",          (PyCFunction)PyPairedVerifiedConstMap_nbytes,                    METH_NOARGS,
+     "Heap size of the slot array in bytes."},
+    {NULL, NULL, 0, NULL}
+};
+
+static PyObject *PyPairedVerifiedConstMap_get_hash(PyPairedVerifiedConstMap *self, void *Py_UNUSED(closure)) {
+    return fcm_hash_name(self->vm.hash);
+}
+
+static PyGetSetDef PyPairedVerifiedConstMap_getset[] = {
+    {"hash", (getter)PyPairedVerifiedConstMap_get_hash, NULL,
+     "The key hash this map was built with: \"xxh64\" (shared with the Go and Rust "
+     "implementations) or \"xxh3\" (fastconstmap only).", NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
+static PyMappingMethods PyPairedVerifiedConstMap_as_mapping = {
+    (lenfunc)PyPairedVerifiedConstMap_length,
+    (binaryfunc)PyPairedVerifiedConstMap_subscript,
+    NULL,
+};
+
+static PySequenceMethods PyPairedVerifiedConstMap_as_sequence = {
+    .sq_contains = (objobjproc)PyPairedVerifiedConstMap_contains,
+};
+
+static PyTypeObject PyPairedVerifiedConstMapType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name        = "fastconstmap._fastconstmap.PairedVerifiedConstMap",
+    .tp_basicsize   = sizeof(PyPairedVerifiedConstMap),
+    .tp_dealloc     = (destructor)PyPairedVerifiedConstMap_dealloc,
+    .tp_as_mapping  = &PyPairedVerifiedConstMap_as_mapping,
+    .tp_as_sequence = &PyPairedVerifiedConstMap_as_sequence,
+    .tp_flags       = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_doc         = "VerifiedConstMap with each value stored next to its check word: fewer cache "
+                      "misses per lookup of a present key, slower for absent keys.",
+    .tp_methods     = PyPairedVerifiedConstMap_methods,
+    .tp_getset      = PyPairedVerifiedConstMap_getset,
+    .tp_init        = (initproc)PyPairedVerifiedConstMap_init,
     .tp_new         = PyType_GenericNew,
 };
 
@@ -903,6 +1330,7 @@ static PyModuleDef fastconstmap_module = {
 PyMODINIT_FUNC PyInit__fastconstmap(void) {
     if (PyType_Ready(&PyConstMapType)        < 0) return NULL;
     if (PyType_Ready(&PyVerifiedConstMapType) < 0) return NULL;
+    if (PyType_Ready(&PyPairedVerifiedConstMapType) < 0) return NULL;
 
     PyObject *m = PyModule_Create(&fastconstmap_module);
     if (!m) return NULL;
@@ -916,6 +1344,12 @@ PyMODINIT_FUNC PyInit__fastconstmap(void) {
     Py_INCREF(&PyVerifiedConstMapType);
     if (PyModule_AddObject(m, "VerifiedConstMap", (PyObject *)&PyVerifiedConstMapType) < 0) {
         Py_DECREF(&PyVerifiedConstMapType);
+        Py_DECREF(m);
+        return NULL;
+    }
+    Py_INCREF(&PyPairedVerifiedConstMapType);
+    if (PyModule_AddObject(m, "PairedVerifiedConstMap", (PyObject *)&PyPairedVerifiedConstMapType) < 0) {
+        Py_DECREF(&PyPairedVerifiedConstMapType);
         Py_DECREF(m);
         return NULL;
     }

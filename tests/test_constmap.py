@@ -6,7 +6,15 @@ import tempfile
 
 import pytest
 
-from fastconstmap import NOT_FOUND, ConstMap, VerifiedConstMap
+from fastconstmap import NOT_FOUND, ConstMap, PairedVerifiedConstMap, VerifiedConstMap
+
+
+# PairedVerifiedConstMap is VerifiedConstMap with a different memory layout,
+# so every verified-map test runs against both.
+@pytest.fixture(params=[VerifiedConstMap, PairedVerifiedConstMap],
+                ids=["verified", "paired"])
+def Verified(request):
+    return request.param
 
 
 # ----- ConstMap -----
@@ -155,78 +163,78 @@ def test_serialize_empty():
 
 # ----- VerifiedConstMap -----
 
-def test_verified_basic():
+def test_verified_basic(Verified):
     d = {"apple": 100, "banana": 200, "cherry": 300}
-    vm = VerifiedConstMap(d)
+    vm = Verified(d)
     for k, v in d.items():
         assert vm[k] == v
 
 
-def test_verified_len():
+def test_verified_len(Verified):
     d = {"apple": 100, "banana": 200, "cherry": 300}
-    vm = VerifiedConstMap(d)
+    vm = Verified(d)
     assert len(vm) == 3
 
 
-def test_verified_len_after_serialization():
+def test_verified_len_after_serialization(Verified):
     d = {"a": 1, "b": 2, "c": 3, "d": 4}
-    vm = VerifiedConstMap(d)
-    vm2 = VerifiedConstMap.from_bytes(vm.to_bytes())
+    vm = Verified(d)
+    vm2 = Verified.from_bytes(vm.to_bytes())
     assert len(vm2) == 4
 
 
-def test_verified_missing_raises():
-    vm = VerifiedConstMap({"a": 1, "b": 2})
+def test_verified_missing_raises(Verified):
+    vm = Verified({"a": 1, "b": 2})
     with pytest.raises(KeyError):
         vm["nope"]
 
 
-def test_verified_get_default():
-    vm = VerifiedConstMap({"a": 1})
+def test_verified_get_default(Verified):
+    vm = Verified({"a": 1})
     assert vm.get("a") == 1
     assert vm.get("missing") is None
     assert vm.get("missing", -1) == -1
 
 
-def test_verified_contains():
-    vm = VerifiedConstMap({"a": 1, "b": 2})
+def test_verified_contains(Verified):
+    vm = Verified({"a": 1, "b": 2})
     assert "a" in vm
     assert "missing" not in vm
     assert 42 not in vm  # non-string
 
 
-def test_verified_get_many_with_missing():
-    vm = VerifiedConstMap({"a": 1, "b": 2, "c": 3})
+def test_verified_get_many_with_missing(Verified):
+    vm = Verified({"a": 1, "b": 2, "c": 3})
     out = vm.get_many(["a", "x", "c"], default=-1)
     assert out == [1, -1, 3]
 
 
-def test_verified_large_with_misses():
+def test_verified_large_with_misses(Verified):
     n = 50_000
     d = {f"k{i}": i for i in range(n)}
-    vm = VerifiedConstMap(d)
+    vm = Verified(d)
     for k, v in d.items():
         assert vm[k] == v
     for i in range(1_000):
         assert vm.get(f"missing-{i}") is None
 
 
-def test_verified_to_from_bytes():
+def test_verified_to_from_bytes(Verified):
     d = {"a": 1, "b": 2, "c": 3}
-    vm = VerifiedConstMap(d)
+    vm = Verified(d)
     b = vm.to_bytes()
-    vm2 = VerifiedConstMap.from_bytes(b)
+    vm2 = Verified.from_bytes(b)
     for k, v in d.items():
         assert vm2[k] == v
     assert "missing" not in vm2
 
 
-def test_verified_save_load(tmp_path):
+def test_verified_save_load(Verified, tmp_path):
     d = {f"k{i}": i for i in range(200)}
-    vm = VerifiedConstMap(d)
+    vm = Verified(d)
     p = tmp_path / "vmap.cmap"
     vm.save(p)
-    vm2 = VerifiedConstMap.load(p)
+    vm2 = Verified.load(p)
     for k, v in d.items():
         assert vm2[k] == v
     assert vm2.get("not-there") is None
@@ -235,10 +243,29 @@ def test_verified_save_load(tmp_path):
 def test_constmap_and_verified_use_distinct_magic():
     cm = ConstMap({"a": 1})
     vm = VerifiedConstMap({"a": 1})
+    pm = PairedVerifiedConstMap({"a": 1})
     with pytest.raises(ValueError):
         VerifiedConstMap.from_bytes(cm.to_bytes())
     with pytest.raises(ValueError):
         ConstMap.from_bytes(vm.to_bytes())
+    with pytest.raises(ValueError):
+        PairedVerifiedConstMap.from_bytes(vm.to_bytes())
+    with pytest.raises(ValueError):
+        VerifiedConstMap.from_bytes(pm.to_bytes())
+
+
+def test_paired_matches_verified():
+    """Same construction, same seed: the paired map is the verified map's
+    two arrays zipped together, so sizes and every answer agree."""
+    rng = random.Random(7)
+    d = {f"k{i}-{rng.random()}": rng.randrange(1 << 64) for i in range(20_000)}
+    vm = VerifiedConstMap(d)
+    pm = PairedVerifiedConstMap(d)
+    assert pm.nbytes() == vm.nbytes()
+    assert pm.serialized_size() == vm.serialized_size()
+    keys = list(d) + [f"absent-{i}" for i in range(5_000)]
+    rng.shuffle(keys)
+    assert pm.get_many(keys) == vm.get_many(keys)
 
 
 # ----- Batched lookups -----
@@ -310,26 +337,26 @@ def test_get_many_into_rejects_readonly_buffer():
         m.get_many_into(["a"], b"\x00" * 8)
 
 
-def test_verified_get_many_crosses_block_boundaries():
+def test_verified_get_many_crosses_block_boundaries(Verified):
     for n in (1, 7, 8, 9, 63, 64, 65, 1000):
         d = {f"key{i}": i * 7 for i in range(n)}
-        vm = VerifiedConstMap(d)
+        vm = Verified(d)
         keys = list(d) + ["missing-key", "another-missing"]
         assert vm.get_many(keys, default=-1) == [d[k] for k in d] + [-1, -1]
 
 
-def test_verified_get_many_matches_single_lookup():
+def test_verified_get_many_matches_single_lookup(Verified):
     rng = random.Random(4242)
     d = {f"k{i}-{rng.random()}": rng.randrange(1 << 63) for i in range(5000)}
-    vm = VerifiedConstMap(d)
+    vm = Verified(d)
     keys = list(d)[:2500] + [f"absent-{i}" for i in range(2500)]
     rng.shuffle(keys)
     assert vm.get_many(keys) == [vm.get(k) for k in keys]
 
 
-def test_verified_get_many_into_marks_missing():
+def test_verified_get_many_into_marks_missing(Verified):
     d = {f"key{i}": i * 5 for i in range(500)}
-    vm = VerifiedConstMap(d)
+    vm = Verified(d)
     keys = list(d) + ["nope", "still-nope"]
     out = array.array("Q", [0]) * len(keys)
     assert vm.get_many_into(keys, out) == len(keys)
@@ -344,7 +371,35 @@ def test_get_many_into_empty_map():
     assert list(out) == [0, 0, 0, 0]
     VerifiedConstMap({}).get_many_into(["a", "b", "c", "d"], out)
     assert list(out) == [NOT_FOUND] * 4
+    PairedVerifiedConstMap({}).get_many_into(["a", "b", "c", "d"], out)
+    assert list(out) == [NOT_FOUND] * 4
 
 
 def test_not_found_sentinel():
     assert NOT_FOUND == 2 ** 64 - 1
+
+
+# ----- Key hash option -----
+
+@pytest.mark.parametrize("Map", [ConstMap, VerifiedConstMap, PairedVerifiedConstMap])
+def test_hash_option(Map):
+    """The default hash is the one shared with the Go and Rust
+    implementations; "xxh3" is the faster fastconstmap-only one. Both answer
+    the same, and each survives a round trip through bytes with its hash."""
+    d = {f"k{i}": i * 3 for i in range(2000)}
+    default = Map(d)
+    fast = Map(d, hash="xxh3")
+    explicit = Map(d, hash="xxh64")
+    assert default.hash == "xxh64" and explicit.hash == "xxh64" and fast.hash == "xxh3"
+    for k, v in d.items():
+        assert default[k] == v and fast[k] == v
+    assert default.to_bytes()[:8] != fast.to_bytes()[:8]
+    for m in (default, fast):
+        again = Map.from_bytes(m.to_bytes())
+        assert again.hash == m.hash
+        assert again["k77"] == 231
+        view = Map.from_buffer(m.to_bytes())
+        assert view.hash == m.hash
+        assert view["k77"] == 231
+    with pytest.raises(ValueError, match="xxh64"):
+        Map(d, hash="sha1")

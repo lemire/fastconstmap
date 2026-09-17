@@ -22,7 +22,7 @@ import sys
 import time
 from typing import Callable
 
-from fastconstmap import ConstMap, VerifiedConstMap
+from fastconstmap import ConstMap, PairedVerifiedConstMap, VerifiedConstMap
 
 
 def make_data(n: int, seed: int = 0xC0FFEE) -> tuple[list[str], dict[str, int]]:
@@ -119,6 +119,10 @@ def main() -> None:
     print(f"  VerifiedConstMap.__init__             {time.perf_counter()-t0:7.3f} s")
 
     t0 = time.perf_counter()
+    pm = PairedVerifiedConstMap(d)
+    print(f"  PairedVerifiedConstMap.__init__       {time.perf_counter()-t0:7.3f} s")
+
+    t0 = time.perf_counter()
     pyd = dict(d)
     print(f"  dict(d)                               {time.perf_counter()-t0:7.3f} s")
 
@@ -130,6 +134,7 @@ def main() -> None:
     print("\nMemory:")
     report_size("ConstMap.nbytes",         cm.nbytes(), n)
     report_size("VerifiedConstMap.nbytes", vm.nbytes(), n)
+    report_size("PairedVerifiedConstMap.nbytes", pm.nbytes(), n)
     dict_total = deep_sizeof(pyd)
     report_size("dict (table+keys+values)", dict_total, n)
     print(f"  {'ratio dict / ConstMap':<38} {dict_total / cm.nbytes():.1f}x")
@@ -140,6 +145,7 @@ def main() -> None:
     time_loop("dict[k]",             n, lambda i: pyd[query[i]])
     time_loop("ConstMap[k]",         n, lambda i: cm[query[i]])
     time_loop("VerifiedConstMap[k]", n, lambda i: vm[query[i]])
+    time_loop("PairedVerifiedConstMap[k]", n, lambda i: pm[query[i]])
 
     # ---- Batched lookup ----
     # Cold rotates through many distinct random batches, so the cache lines a
@@ -175,6 +181,10 @@ def main() -> None:
                lambda: vm.get_many(cold()))
     time_batch("VerifiedConstMap.get_many_into (cold)", args.batches, args.batch_size,
                lambda: vm.get_many_into(cold(), out))
+    time_batch("PairedVerifiedConstMap.get_many (cold)", args.batches, args.batch_size,
+               lambda: pm.get_many(cold()))
+    time_batch("PairedVerifiedConstMap.get_many_into (cold)", args.batches, args.batch_size,
+               lambda: pm.get_many_into(cold(), out))
 
     # ---- Serialization ----
     print("\nSerialization:")

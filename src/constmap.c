@@ -19,6 +19,18 @@
 #  include <intrin.h>
 #endif
 
+/* The paired layout reads each {value, check} slot as one 128-bit word. SSE2
+ * is baseline on x86-64 and NEON on AArch64, so no runtime dispatch is needed;
+ * other targets take the scalar path, which does the same six loads the split
+ * layout does but from three cache lines. */
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <emmintrin.h>
+#  define FCM_HAVE_SSE2 1
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+#  include <arm_neon.h>
+#  define FCM_HAVE_NEON 1
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Hashing                                                                   */
 /* ------------------------------------------------------------------------- */
@@ -44,8 +56,59 @@ static inline uint64_t fcm_splitmix64(uint64_t *state) {
     return z ^ (z >> 31);
 }
 
-static inline uint64_t fcm_hash_key(const char *key, size_t len) {
-    return (uint64_t)XXH3_64bits(key, len);
+#if defined(_MSC_VER)
+#  define FCM_FORCE_INLINE static __forceinline
+#else
+#  define FCM_FORCE_INLINE static inline __attribute__((always_inline))
+#endif
+
+/* Both key hashes are called through the vendored xxhash.h's force-inlined
+ * internals rather than its public entry points: those are merely
+ * `static inline` even under XXH_INLINE_ALL, and with this many call sites
+ * clang leaves them out of line, so every lookup would pay a call, a register
+ * spill and the loss of the hoisting the batched lookups count on.
+ *
+ * Contract: fcm_hash_key_xxh64 must compute exactly XXH64(key, len, 0) and
+ * fcm_hash_key_xxh3 exactly XXH3_64bits(key, len), because that is what every
+ * serialized map was built with (in Go and Rust as much as here). Both are
+ * verbatim copies of those functions' bodies, and the version check makes a
+ * header bump a build failure until someone has compared them again, since a
+ * changed body would silently desynchronise every existing map. */
+#if XXH_VERSION_NUMBER != 802
+#  error "xxhash.h changed: re-check fcm_hash_key_xxh64/xxh3 against XXH64/XXH3_64bits, then update this version"
+#endif
+
+FCM_FORCE_INLINE uint64_t fcm_hash_key_xxh64(const char *key, size_t len) {
+    return (uint64_t)XXH64_endian_align((const uint8_t *)key, len, 0, XXH_unaligned);
+}
+
+/* Out of line on purpose: only maps loaded from fastconstmap <= 0.9 files use
+ * it, and keeping it out of the lookups keeps them small. */
+static uint64_t fcm_hash_key_xxh3(const char *key, size_t len) {
+    return (uint64_t)XXH3_64bits_internal(key, len, 0, XXH3_kSecret,
+                                          sizeof(XXH3_kSecret),
+                                          XXH3_hashLong_64b_default);
+}
+
+FCM_FORCE_INLINE uint64_t fcm_hash_key(uint32_t hash, const char *key, size_t len) {
+    if (hash == FCM_HASH_XXH3) return fcm_hash_key_xxh3(key, len);
+    return fcm_hash_key_xxh64(key, len);
+}
+
+/* Hashes and mixes a block of keys, choosing the hash once for the block
+ * rather than per key, so the common XXH64 loop carries no branch and the
+ * compiler can hoist what is loop-invariant out of it. */
+FCM_FORCE_INLINE void fcm_hash_block(uint32_t hash, const fcm_key_t *keys, size_t n,
+                                     uint64_t seed, uint64_t *out) {
+    if (hash == FCM_HASH_XXH3) {
+        for (size_t j = 0; j < n; j++) {
+            out[j] = fcm_mixsplit(fcm_hash_key_xxh3(keys[j].bytes, keys[j].len), seed);
+        }
+    } else {
+        for (size_t j = 0; j < n; j++) {
+            out[j] = fcm_mixsplit(fcm_hash_key_xxh64(keys[j].bytes, keys[j].len), seed);
+        }
+    }
 }
 
 /* (hash * N) >> 64, where N fits in uint32. */
@@ -150,7 +213,7 @@ static void fcm_init_params(fcm_params_t *p, uint32_t size) {
 }
 
 /* ------------------------------------------------------------------------- */
-/* Construction (peeling) — shared between ConstMap and VerifiedConstMap     */
+/* Construction (peeling) — shared by all three constructors                 */
 /* ------------------------------------------------------------------------- */
 
 #define FCM_MAX_ITERATIONS 100
@@ -351,12 +414,37 @@ static inline uint64_t fcm_fingerprint(uint64_t hash) {
     return hash ^ (hash >> 32);
 }
 
-int fcm_constmap_new(fcm_constmap_t *out,
+/* XOR of three slots, as the paired lookup reads them. */
+static inline fcm_slot_t fcm_slot_xor3(const fcm_slot_t *slots,
+                                       uint32_t h0, uint32_t h1, uint32_t h2) {
+    fcm_slot_t r;
+#if defined(FCM_HAVE_SSE2)
+    __m128i v = _mm_loadu_si128((const __m128i *)&slots[h0]);
+    v = _mm_xor_si128(v, _mm_loadu_si128((const __m128i *)&slots[h1]));
+    v = _mm_xor_si128(v, _mm_loadu_si128((const __m128i *)&slots[h2]));
+    r.value = (uint64_t)_mm_cvtsi128_si64(v);
+    r.check = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(v, v));
+#elif defined(FCM_HAVE_NEON)
+    uint64x2_t v = vld1q_u64((const uint64_t *)&slots[h0]);
+    v = veorq_u64(v, vld1q_u64((const uint64_t *)&slots[h1]));
+    v = veorq_u64(v, vld1q_u64((const uint64_t *)&slots[h2]));
+    r.value = vgetq_lane_u64(v, 0);
+    r.check = vgetq_lane_u64(v, 1);
+#else
+    r.value = slots[h0].value ^ slots[h1].value ^ slots[h2].value;
+    r.check = slots[h0].check ^ slots[h1].check ^ slots[h2].check;
+#endif
+    return r;
+}
+
+int fcm_constmap_new_with_hash(fcm_constmap_t *out,
                      const fcm_key_t *keys,
                      const uint64_t  *values,
-                     size_t n) {
+                     size_t n, uint32_t hash) {
     if (!out) return FCM_E_LENGTH_MISMATCH;
+    if (hash != FCM_HASH_XXH64 && hash != FCM_HASH_XXH3) return FCM_E_INVALID_FORMAT;
     memset(out, 0, sizeof(*out));
+    out->hash = hash;
     if (n == 0) return FCM_OK;
     if (n > 0xFFFFFFFFu) return FCM_E_LENGTH_MISMATCH;
 
@@ -383,7 +471,7 @@ int fcm_constmap_new(fcm_constmap_t *out,
     }
 
     for (size_t i = 0; i < n; i++) {
-        hashed[i] = fcm_hash_key(keys[i].bytes, keys[i].len);
+        hashed[i] = fcm_hash_key(hash, keys[i].bytes, keys[i].len);
     }
 
     rc = fcm_peel(hashed, size, &params, alone, t2count, t2hash,
@@ -418,6 +506,7 @@ int fcm_constmap_new(fcm_constmap_t *out,
     out->data_len             = params.array_len;
     out->n                    = size;
     out->data                 = data;
+    out->hash                 = hash;
     data = NULL;  /* ownership transferred */
 
 cleanup:
@@ -432,12 +521,14 @@ cleanup:
     return rc;
 }
 
-int fcm_verified_constmap_new(fcm_verified_constmap_t *out,
+int fcm_verified_constmap_new_with_hash(fcm_verified_constmap_t *out,
                               const fcm_key_t *keys,
                               const uint64_t  *values,
-                              size_t n) {
+                              size_t n, uint32_t hash) {
     if (!out) return FCM_E_LENGTH_MISMATCH;
+    if (hash != FCM_HASH_XXH64 && hash != FCM_HASH_XXH3) return FCM_E_INVALID_FORMAT;
     memset(out, 0, sizeof(*out));
+    out->hash = hash;
     if (n == 0) return FCM_OK;
     if (n > 0xFFFFFFFFu) return FCM_E_LENGTH_MISMATCH;
 
@@ -464,7 +555,7 @@ int fcm_verified_constmap_new(fcm_verified_constmap_t *out,
     }
 
     for (size_t i = 0; i < n; i++) {
-        hashed[i] = fcm_hash_key(keys[i].bytes, keys[i].len);
+        hashed[i] = fcm_hash_key(hash, keys[i].bytes, keys[i].len);
     }
 
     rc = fcm_peel(hashed, size, &params, alone, t2count, t2hash,
@@ -501,6 +592,7 @@ int fcm_verified_constmap_new(fcm_verified_constmap_t *out,
     out->n                    = size;
     out->data                 = data;
     out->checks               = checks;
+    out->hash                 = hash;
     data   = NULL;
     checks = NULL;
 
@@ -517,6 +609,105 @@ cleanup:
     return rc;
 }
 
+int fcm_paired_verified_constmap_new_with_hash(fcm_paired_verified_constmap_t *out,
+                                     const fcm_key_t *keys,
+                                     const uint64_t  *values,
+                                     size_t n, uint32_t hash) {
+    if (!out) return FCM_E_LENGTH_MISMATCH;
+    if (hash != FCM_HASH_XXH64 && hash != FCM_HASH_XXH3) return FCM_E_INVALID_FORMAT;
+    memset(out, 0, sizeof(*out));
+    out->hash = hash;
+    if (n == 0) return FCM_OK;
+    if (n > 0xFFFFFFFFu) return FCM_E_LENGTH_MISMATCH;
+
+    uint32_t size = (uint32_t)n;
+    int rc = FCM_OK;
+
+    fcm_params_t params;
+    fcm_init_params(&params, size);
+
+    uint64_t *hashed        = (uint64_t *)malloc((size_t)n * sizeof(uint64_t));
+    fcm_slot_t *slots       = (fcm_slot_t *)calloc(params.array_len, sizeof(fcm_slot_t));
+    uint32_t *alone         = (uint32_t *)malloc((size_t)params.array_len * sizeof(uint32_t));
+    uint8_t  *t2count       = (uint8_t  *)calloc(params.array_len, sizeof(uint8_t));
+    uint64_t *t2hash        = (uint64_t *)calloc(params.array_len, sizeof(uint64_t));
+    uint8_t  *reverse_h     = (uint8_t  *)malloc((size_t)size);
+    uint64_t *reverse_order = (uint64_t *)calloc((size_t)size + 1, sizeof(uint64_t));
+    fcm_pair_t *pairs       = (fcm_pair_t *)malloc((size_t)n * sizeof(fcm_pair_t));
+
+    if (!hashed || !slots || !alone || !t2count || !t2hash ||
+        !reverse_h || !reverse_order || !pairs) {
+        rc = FCM_E_NOMEM;
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        hashed[i] = fcm_hash_key(hash, keys[i].bytes, keys[i].len);
+    }
+
+    rc = fcm_peel(hashed, size, &params, alone, t2count, t2hash,
+                  reverse_h, reverse_order);
+    if (rc != FCM_OK) goto cleanup;
+
+    for (size_t i = 0; i < n; i++) {
+        pairs[i].hash  = fcm_mixsplit(hashed[i], params.seed);
+        pairs[i].value = values[i];
+    }
+    qsort(pairs, n, sizeof(fcm_pair_t), fcm_pair_cmp);
+
+    uint32_t h012[5];
+    for (int32_t i = (int32_t)size - 1; i >= 0; i--) {
+        uint64_t hash = reverse_order[i];
+        uint64_t val  = fcm_pair_lookup(pairs, n, hash);
+        uint64_t fp   = fcm_fingerprint(hash);
+        uint32_t i1, i2, i3;
+        fcm_get_h012(hash, params.segment_length, params.segment_length_mask,
+                     params.segment_count_length, &i1, &i2, &i3);
+        uint8_t found = reverse_h[i];
+        h012[0] = i1; h012[1] = i2; h012[2] = i3;
+        h012[3] = h012[0]; h012[4] = h012[1];
+        slots[h012[found]].value = val ^ slots[h012[found + 1]].value ^ slots[h012[found + 2]].value;
+        slots[h012[found]].check = fp  ^ slots[h012[found + 1]].check ^ slots[h012[found + 2]].check;
+    }
+
+    out->seed                 = params.seed;
+    out->segment_length       = params.segment_length;
+    out->segment_length_mask  = params.segment_length_mask;
+    out->segment_count        = params.segment_count;
+    out->segment_count_length = params.segment_count_length;
+    out->data_len             = params.array_len;
+    out->n                    = size;
+    out->slots                = slots;
+    out->hash                 = hash;
+    slots = NULL;  /* ownership transferred */
+
+cleanup:
+    free(hashed);
+    free(slots);
+    free(alone);
+    free(t2count);
+    free(t2hash);
+    free(reverse_h);
+    free(reverse_order);
+    free(pairs);
+    return rc;
+}
+
+int fcm_constmap_new(fcm_constmap_t *out, const fcm_key_t *keys,
+                     const uint64_t *values, size_t n) {
+    return fcm_constmap_new_with_hash(out, keys, values, n, FCM_HASH_XXH64);
+}
+
+int fcm_verified_constmap_new(fcm_verified_constmap_t *out, const fcm_key_t *keys,
+                              const uint64_t *values, size_t n) {
+    return fcm_verified_constmap_new_with_hash(out, keys, values, n, FCM_HASH_XXH64);
+}
+
+int fcm_paired_verified_constmap_new(fcm_paired_verified_constmap_t *out, const fcm_key_t *keys,
+                                     const uint64_t *values, size_t n) {
+    return fcm_paired_verified_constmap_new_with_hash(out, keys, values, n, FCM_HASH_XXH64);
+}
+
 void fcm_constmap_free(fcm_constmap_t *cm) {
     if (!cm) return;
     free(cm->data);
@@ -530,6 +721,12 @@ void fcm_verified_constmap_free(fcm_verified_constmap_t *vm) {
     memset(vm, 0, sizeof(*vm));
 }
 
+void fcm_paired_verified_constmap_free(fcm_paired_verified_constmap_t *pm) {
+    if (!pm) return;
+    free(pm->slots);
+    memset(pm, 0, sizeof(*pm));
+}
+
 /* ------------------------------------------------------------------------- */
 /* Lookup                                                                    */
 /* ------------------------------------------------------------------------- */
@@ -537,7 +734,7 @@ void fcm_verified_constmap_free(fcm_verified_constmap_t *vm) {
 uint64_t fcm_constmap_lookup(const fcm_constmap_t *cm,
                              const char *key, size_t key_len) {
     if (cm->data_len == 0) return 0;
-    uint64_t hash = fcm_mixsplit(fcm_hash_key(key, key_len), cm->seed);
+    uint64_t hash = fcm_mixsplit(fcm_hash_key(cm->hash, key, key_len), cm->seed);
     uint32_t h0, h1, h2;
     fcm_get_h012(hash, cm->segment_length, cm->segment_length_mask,
                  cm->segment_count_length, &h0, &h1, &h2);
@@ -547,13 +744,24 @@ uint64_t fcm_constmap_lookup(const fcm_constmap_t *cm,
 uint64_t fcm_verified_constmap_lookup(const fcm_verified_constmap_t *vm,
                                       const char *key, size_t key_len) {
     if (vm->data_len == 0) return FCM_NOT_FOUND;
-    uint64_t hash = fcm_mixsplit(fcm_hash_key(key, key_len), vm->seed);
+    uint64_t hash = fcm_mixsplit(fcm_hash_key(vm->hash, key, key_len), vm->seed);
     uint32_t h0, h1, h2;
     fcm_get_h012(hash, vm->segment_length, vm->segment_length_mask,
                  vm->segment_count_length, &h0, &h1, &h2);
     uint64_t fp = vm->checks[h0] ^ vm->checks[h1] ^ vm->checks[h2];
     if (fp != fcm_fingerprint(hash)) return FCM_NOT_FOUND;
     return vm->data[h0] ^ vm->data[h1] ^ vm->data[h2];
+}
+
+uint64_t fcm_paired_verified_constmap_lookup(const fcm_paired_verified_constmap_t *pm,
+                                             const char *key, size_t key_len) {
+    if (pm->data_len == 0) return FCM_NOT_FOUND;
+    uint64_t hash = fcm_mixsplit(fcm_hash_key(pm->hash, key, key_len), pm->seed);
+    uint32_t h0, h1, h2;
+    fcm_get_h012(hash, pm->segment_length, pm->segment_length_mask,
+                 pm->segment_count_length, &h0, &h1, &h2);
+    fcm_slot_t r = fcm_slot_xor3(pm->slots, h0, h1, h2);
+    return r.check == fcm_fingerprint(hash) ? r.value : FCM_NOT_FOUND;
 }
 
 /* Batched lookup.
@@ -567,9 +775,9 @@ uint64_t fcm_verified_constmap_lookup(const fcm_verified_constmap_t *vm,
  *
  * This matches the MapMany/MapManyInto of the Go original (v1.1.0), minus its
  * batched hash routine: that exists because Go pays a call per key and reloads
- * the XXH64 primes each time, whereas XXH_INLINE_ALL inlines XXH3 straight
- * into the loop below, so the compiler already hoists what is loop-invariant
- * out of the block. */
+ * the XXH64 primes each time, whereas fcm_hash_key_xxh64 is force-inlined
+ * straight into the loop below, so the compiler already hoists what is
+ * loop-invariant out of the block. */
 #ifndef FCM_BATCH_BLOCK
 #define FCM_BATCH_BLOCK 8
 #endif
@@ -584,13 +792,13 @@ void fcm_constmap_lookup_many(const fcm_constmap_t *cm,
 
     const uint64_t *data = cm->data;
     uint32_t h0[FCM_BATCH_BLOCK], h1[FCM_BATCH_BLOCK], h2[FCM_BATCH_BLOCK];
+    uint64_t hashes[FCM_BATCH_BLOCK];
 
     size_t i = 0;
     for (; i + FCM_BATCH_BLOCK <= n; i += FCM_BATCH_BLOCK) {
+        fcm_hash_block(cm->hash, keys + i, FCM_BATCH_BLOCK, cm->seed, hashes);
         for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
-            uint64_t hash = fcm_mixsplit(
-                fcm_hash_key(keys[i + j].bytes, keys[i + j].len), cm->seed);
-            fcm_get_h012(hash, cm->segment_length, cm->segment_length_mask,
+            fcm_get_h012(hashes[j], cm->segment_length, cm->segment_length_mask,
                          cm->segment_count_length, &h0[j], &h1[j], &h2[j]);
         }
         for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
@@ -618,11 +826,9 @@ void fcm_verified_constmap_lookup_many(const fcm_verified_constmap_t *vm,
 
     size_t i = 0;
     for (; i + FCM_BATCH_BLOCK <= n; i += FCM_BATCH_BLOCK) {
+        fcm_hash_block(vm->hash, keys + i, FCM_BATCH_BLOCK, vm->seed, hashes);
         for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
-            uint64_t hash = fcm_mixsplit(
-                fcm_hash_key(keys[i + j].bytes, keys[i + j].len), vm->seed);
-            hashes[j] = hash;
-            fcm_get_h012(hash, vm->segment_length, vm->segment_length_mask,
+            fcm_get_h012(hashes[j], vm->segment_length, vm->segment_length_mask,
                          vm->segment_count_length, &h0[j], &h1[j], &h2[j]);
         }
         for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
@@ -636,27 +842,112 @@ void fcm_verified_constmap_lookup_many(const fcm_verified_constmap_t *vm,
     }
 }
 
+void fcm_paired_verified_constmap_lookup_many(const fcm_paired_verified_constmap_t *pm,
+                                              const fcm_key_t *keys, size_t n,
+                                              uint64_t *out) {
+    if (pm->data_len == 0) {
+        for (size_t i = 0; i < n; i++) out[i] = FCM_NOT_FOUND;
+        return;
+    }
+
+    const fcm_slot_t *slots = pm->slots;
+    uint32_t h0[FCM_BATCH_BLOCK], h1[FCM_BATCH_BLOCK], h2[FCM_BATCH_BLOCK];
+    uint64_t hashes[FCM_BATCH_BLOCK];
+
+    size_t i = 0;
+    for (; i + FCM_BATCH_BLOCK <= n; i += FCM_BATCH_BLOCK) {
+        fcm_hash_block(pm->hash, keys + i, FCM_BATCH_BLOCK, pm->seed, hashes);
+        for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
+            fcm_get_h012(hashes[j], pm->segment_length, pm->segment_length_mask,
+                         pm->segment_count_length, &h0[j], &h1[j], &h2[j]);
+        }
+        for (size_t j = 0; j < FCM_BATCH_BLOCK; j++) {
+            fcm_slot_t r = fcm_slot_xor3(slots, h0[j], h1[j], h2[j]);
+            out[i + j] = (r.check == fcm_fingerprint(hashes[j])) ? r.value : FCM_NOT_FOUND;
+        }
+    }
+    for (; i < n; i++) {
+        out[i] = fcm_paired_verified_constmap_lookup(pm, keys[i].bytes, keys[i].len);
+    }
+}
+
+
 /* ------------------------------------------------------------------------- */
 /* Serialisation                                                             */
 /*                                                                           */
-/* Binary format (little-endian):                                            */
+/* Binary format (little-endian), shared with github.com/lemire/constmap     */
+/* (Go) and rsconstmap:                                                      */
 /*   [8] magic                                                               */
 /*   [8] seed                                                                */
 /*   [4] segment_length                                                      */
 /*   [4] segment_count                                                       */
-/*   [4] data_len                                                            */
-/*   [4] reserved (zero) — pads the header to 32 bytes so the data array      */
-/*       starts 8-byte aligned, enabling zero-copy uint64 views               */
+/*   [4] data_len: number of words, or of slots for a paired map             */
+/*   [4] original key count. Go and rsconstmap write zero here and ignore   */
+/*       it on read, so a map loaded from their files reports n = 0. Absent  */
+/*       from CMAP0001, whose header is 28 bytes.                            */
 /*   [8 * data_len] data                                                     */
 /*   (verified only) [8 * data_len] checks                                   */
+/*   (paired only, in place of data and checks) [16 * data_len] slots, each  */
+/*       a value word followed by its check word                             */
 /*   [8] FNV-1a-64 checksum of all preceding bytes                           */
+/*                                                                           */
+/* The magic identifies the map type, the key hash and the header size:      */
+/*                                                                           */
+/*   magic     type      hash   header  written by                           */
+/*   CMAP0003  ConstMap  XXH64  32      fastconstmap >= 0.10                 */
+/*   CMAP0001  ConstMap  XXH64  28      constmap (Go), rsconstmap            */
+/*   CMAP0002  ConstMap  XXH3   32      fastconstmap <= 0.9, and maps built  */
+/*                                      with FCM_HASH_XXH3 since             */
+/*   VMAP0001  Verified  XXH64  32      all three                            */
+/*   VCMP0002  Verified  XXH3   32      fastconstmap <= 0.9, and maps built  */
+/*                                      with FCM_HASH_XXH3 since             */
+/*   PMAP0001  Paired    XXH64  32      all three                            */
+/*   PVCM0001  Paired    XXH3   32      fastconstmap, maps built with XXH3   */
+/*                                                                           */
+/* Each reader accepts every magic of its type. Each writer produces the     */
+/* magic of its type for the hash the map was built with: the shared XXH64   */
+/* format normally, the legacy one for a map loaded from a fastconstmap 0.9  */
+/* file, since its table only answers to XXH3 and cannot be converted (the   */
+/* only way to a shared-format file is rebuilding from the keys). CMAP0003   */
+/* exists because CMAP0001 has no room for the                               */
+/* key count that fcm_constmap_t.n and Python's len() report. A 32-byte      */
+/* header also keeps the array 8-byte aligned for the zero-copy views, which */
+/* a CMAP0001 buffer is not unless it starts 4 bytes off an 8-byte boundary. */
 /* ------------------------------------------------------------------------- */
 
-static const uint8_t fcm_magic_constmap[8]          = {'C','M','A','P','0','0','0','2'};
-static const uint8_t fcm_magic_verified_constmap[8] = {'V','C','M','P','0','0','0','2'};
+typedef struct {
+    uint8_t  magic[8];
+    uint32_t hash;         /* FCM_HASH_* */
+    uint32_t header_size;  /* 28 or 32 */
+} fcm_format_t;
 
-#define FCM_HEADER_SIZE 32u  /* 8 magic + 8 seed + 4 seglen + 4 segcount + 4 datalen + 4 pad */
-#define FCM_TRAILER_SIZE 8u  /* checksum */
+static const fcm_format_t fcm_constmap_formats[] = {
+    { {'C','M','A','P','0','0','0','3'}, FCM_HASH_XXH64, 32 },
+    { {'C','M','A','P','0','0','0','1'}, FCM_HASH_XXH64, 28 },
+    { {'C','M','A','P','0','0','0','2'}, FCM_HASH_XXH3,  32 },
+};
+static const fcm_format_t fcm_verified_formats[] = {
+    { {'V','M','A','P','0','0','0','1'}, FCM_HASH_XXH64, 32 },
+    { {'V','C','M','P','0','0','0','2'}, FCM_HASH_XXH3,  32 },
+};
+static const fcm_format_t fcm_paired_formats[] = {
+    { {'P','M','A','P','0','0','0','1'}, FCM_HASH_XXH64, 32 },
+    { {'P','V','C','M','0','0','0','1'}, FCM_HASH_XXH3,  32 },
+};
+#define FCM_NFORMATS(a) (sizeof(a) / sizeof((a)[0]))
+
+/* The format a writer uses for a map built with `hash`: the first entry of
+ * the table with that hash, or NULL if the type has none for it. */
+static const fcm_format_t *fcm_format_for(const fcm_format_t *formats, size_t nformats,
+                                          uint32_t hash) {
+    for (size_t i = 0; i < nformats; i++) {
+        if (formats[i].hash == hash) return &formats[i];
+    }
+    return NULL;
+}
+
+#define FCM_HEADER_SIZE  32u  /* what the writers produce */
+#define FCM_TRAILER_SIZE  8u  /* checksum */
 
 static inline void fcm_write_u32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)(v      );
@@ -701,180 +992,214 @@ static uint64_t fcm_fnv1a64(const uint8_t *data, size_t len) {
     return h;
 }
 
-size_t fcm_constmap_serialized_size(const fcm_constmap_t *cm) {
-    return FCM_HEADER_SIZE + (size_t)cm->data_len * 8u + FCM_TRAILER_SIZE;
+/* Writes the 32-byte header every writer produces. */
+static uint8_t *fcm_write_header(uint8_t *p, const fcm_format_t *fmt, uint64_t seed,
+                                 uint32_t segment_length, uint32_t segment_count,
+                                 uint32_t data_len, uint32_t n) {
+    memcpy(p, fmt->magic, 8);            p += 8;
+    fcm_write_u64(p, seed);              p += 8;
+    fcm_write_u32(p, segment_length);    p += 4;
+    fcm_write_u32(p, segment_count);     p += 4;
+    fcm_write_u32(p, data_len);          p += 4;
+    fcm_write_u32(p, n);                 p += 4;
+    return p;
 }
 
-int fcm_constmap_write(const fcm_constmap_t *cm, void *buf) {
-    uint8_t *p = (uint8_t *)buf;
-    uint8_t *start = p;
-    memcpy(p, fcm_magic_constmap, 8); p += 8;
-    fcm_write_u64(p, cm->seed); p += 8;
-    fcm_write_u32(p, cm->segment_length); p += 4;
-    fcm_write_u32(p, cm->segment_count);  p += 4;
-    fcm_write_u32(p, cm->data_len);       p += 4;
-    fcm_write_u32(p, cm->n);              p += 4;  /* original key count (was reserved) */
-    for (uint32_t i = 0; i < cm->data_len; i++) {
-        fcm_write_u64(p, cm->data[i]); p += 8;
+/* A parsed header, with the buffer already checked for length and checksum. */
+typedef struct {
+    const fcm_format_t *format;
+    uint64_t seed;
+    uint32_t segment_length;
+    uint32_t segment_count;
+    uint32_t data_len;
+    uint32_t n;
+    size_t   payload;   /* offset of the first array */
+} fcm_header_t;
+
+/* Recognises the magic among `formats`, reads the header, and verifies the
+ * buffer holds the whole map and that its checksum matches. `entry_bytes` is
+ * what one unit of data_len occupies: 8 for a ConstMap, 16 for the others. */
+static int fcm_parse(const uint8_t *p, size_t buf_len,
+                     const fcm_format_t *formats, size_t nformats,
+                     size_t entry_bytes, fcm_header_t *h) {
+    if (buf_len < 8) return FCM_E_SHORT_BUFFER;
+    h->format = NULL;
+    for (size_t i = 0; i < nformats; i++) {
+        if (memcmp(p, formats[i].magic, 8) == 0) { h->format = &formats[i]; break; }
     }
-    uint64_t sum = fcm_fnv1a64(start, (size_t)(p - start));
-    fcm_write_u64(p, sum);
-    return FCM_OK;
-}
+    if (!h->format) return FCM_E_INVALID_FORMAT;
 
-int fcm_constmap_read(fcm_constmap_t *out, const void *buf, size_t buf_len) {
-    if (!out) return FCM_E_INVALID_FORMAT;
-    memset(out, 0, sizeof(*out));
-    if (buf_len < FCM_HEADER_SIZE + FCM_TRAILER_SIZE) return FCM_E_SHORT_BUFFER;
+    size_t header_size = h->format->header_size;
+    if (buf_len < header_size + FCM_TRAILER_SIZE) return FCM_E_SHORT_BUFFER;
+    h->seed           = fcm_read_u64(p + 8);
+    h->segment_length = fcm_read_u32(p + 16);
+    h->segment_count  = fcm_read_u32(p + 20);
+    h->data_len       = fcm_read_u32(p + 24);
+    h->n              = header_size == 32 ? fcm_read_u32(p + 28) : 0;
+    h->payload        = header_size;
 
-    const uint8_t *p = (const uint8_t *)buf;
-    if (memcmp(p, fcm_magic_constmap, 8) != 0) return FCM_E_INVALID_FORMAT;
-
-    uint64_t seed            = fcm_read_u64(p + 8);
-    uint32_t segment_length  = fcm_read_u32(p + 16);
-    uint32_t segment_count   = fcm_read_u32(p + 20);
-    uint32_t data_len        = fcm_read_u32(p + 24);
-    uint32_t n               = fcm_read_u32(p + 28);  /* original key count */
-
-    size_t expected = FCM_HEADER_SIZE + (size_t)data_len * 8u + FCM_TRAILER_SIZE;
+    size_t expected = header_size + (size_t)h->data_len * entry_bytes + FCM_TRAILER_SIZE;
     if (buf_len < expected) return FCM_E_SHORT_BUFFER;
 
     uint64_t got_sum      = fcm_read_u64(p + expected - 8);
     uint64_t expected_sum = fcm_fnv1a64(p, expected - 8);
     if (got_sum != expected_sum) return FCM_E_CHECKSUM;
-
-    uint64_t *data = NULL;
-    if (data_len > 0) {
-        data = (uint64_t *)malloc((size_t)data_len * sizeof(uint64_t));
-        if (!data) return FCM_E_NOMEM;
-        const uint8_t *dp = p + FCM_HEADER_SIZE;
-        for (uint32_t i = 0; i < data_len; i++) {
-            data[i] = fcm_read_u64(dp + (size_t)i * 8);
-        }
-    }
-    out->seed                 = seed;
-    out->segment_length       = segment_length;
-    out->segment_length_mask  = segment_length ? segment_length - 1 : 0;
-    out->segment_count        = segment_count;
-    out->segment_count_length = segment_count * segment_length;
-    out->data_len             = data_len;
-    out->n                    = n;
-    out->data                 = data;
     return FCM_OK;
 }
 
-size_t fcm_verified_constmap_serialized_size(const fcm_verified_constmap_t *vm) {
-    return FCM_HEADER_SIZE + (size_t)vm->data_len * 16u + FCM_TRAILER_SIZE;
+/* The segment parameters must describe exactly `slot_count` slots, so that
+ * every position a lookup derives from them is in range: h0 is below
+ * segment_count * segment_length, and h1 and h2 each one segment further, so
+ * h2 < (segment_count + 2) * segment_length. That needs segment_length to be
+ * a power of two (h1 and h2 are formed by XORing bits below it) and
+ * segment_count to be at least one (with zero, h0 is always 0 and h2 lands in
+ * a third segment that does not exist). The lookups index the slot array
+ * without bounds checks, so this is enforced on every deserialized map; the
+ * checksum catches accidental corruption, this catches a file that is
+ * consistent but not ours. */
+static int fcm_paired_params_ok(uint32_t segment_length, uint32_t segment_count,
+                                uint32_t slot_count) {
+    if (slot_count == 0) return 1;
+    if (segment_length == 0 || (segment_length & (segment_length - 1)) != 0) return 0;
+    if (segment_count == 0) return 0;
+    return ((uint64_t)segment_count + 2) * (uint64_t)segment_length == (uint64_t)slot_count;
 }
-
-int fcm_verified_constmap_write(const fcm_verified_constmap_t *vm, void *buf) {
-    uint8_t *p = (uint8_t *)buf;
-    uint8_t *start = p;
-    memcpy(p, fcm_magic_verified_constmap, 8); p += 8;
-    fcm_write_u64(p, vm->seed); p += 8;
-    fcm_write_u32(p, vm->segment_length); p += 4;
-    fcm_write_u32(p, vm->segment_count);  p += 4;
-    fcm_write_u32(p, vm->data_len);       p += 4;
-    fcm_write_u32(p, vm->n);              p += 4;  /* original key count (was reserved) */
-    for (uint32_t i = 0; i < vm->data_len; i++) {
-        fcm_write_u64(p, vm->data[i]); p += 8;
-    }
-    for (uint32_t i = 0; i < vm->data_len; i++) {
-        fcm_write_u64(p, vm->checks[i]); p += 8;
-    }
-    uint64_t sum = fcm_fnv1a64(start, (size_t)(p - start));
-    fcm_write_u64(p, sum);
-    return FCM_OK;
-}
-
-int fcm_verified_constmap_read(fcm_verified_constmap_t *out, const void *buf, size_t buf_len) {
-    if (!out) return FCM_E_INVALID_FORMAT;
-    memset(out, 0, sizeof(*out));
-    if (buf_len < FCM_HEADER_SIZE + FCM_TRAILER_SIZE) return FCM_E_SHORT_BUFFER;
-
-    const uint8_t *p = (const uint8_t *)buf;
-    if (memcmp(p, fcm_magic_verified_constmap, 8) != 0) return FCM_E_INVALID_FORMAT;
-
-    uint64_t seed            = fcm_read_u64(p + 8);
-    uint32_t segment_length  = fcm_read_u32(p + 16);
-    uint32_t segment_count   = fcm_read_u32(p + 20);
-    uint32_t data_len        = fcm_read_u32(p + 24);
-    uint32_t n               = fcm_read_u32(p + 28);  /* original key count */
-
-    size_t expected = FCM_HEADER_SIZE + (size_t)data_len * 16u + FCM_TRAILER_SIZE;
-    if (buf_len < expected) return FCM_E_SHORT_BUFFER;
-
-    uint64_t got_sum      = fcm_read_u64(p + expected - 8);
-    uint64_t expected_sum = fcm_fnv1a64(p, expected - 8);
-    if (got_sum != expected_sum) return FCM_E_CHECKSUM;
-
-    uint64_t *data   = NULL;
-    uint64_t *checks = NULL;
-    if (data_len > 0) {
-        data   = (uint64_t *)malloc((size_t)data_len * sizeof(uint64_t));
-        checks = (uint64_t *)malloc((size_t)data_len * sizeof(uint64_t));
-        if (!data || !checks) { free(data); free(checks); return FCM_E_NOMEM; }
-        const uint8_t *dp = p + FCM_HEADER_SIZE;
-        for (uint32_t i = 0; i < data_len; i++) {
-            data[i] = fcm_read_u64(dp + (size_t)i * 8);
-        }
-        const uint8_t *cp = dp + (size_t)data_len * 8;
-        for (uint32_t i = 0; i < data_len; i++) {
-            checks[i] = fcm_read_u64(cp + (size_t)i * 8);
-        }
-    }
-    out->seed                 = seed;
-    out->segment_length       = segment_length;
-    out->segment_length_mask  = segment_length ? segment_length - 1 : 0;
-    out->segment_count        = segment_count;
-    out->segment_count_length = segment_count * segment_length;
-    out->data_len             = data_len;
-    out->n                    = n;
-    out->data                 = data;
-    out->checks               = checks;
-    return FCM_OK;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Zero-copy views                                                           */
-/* ------------------------------------------------------------------------- */
 
 static inline int fcm_host_is_little_endian(void) {
     const uint16_t x = 1;
     return *(const uint8_t *)&x == 1;
 }
 
+/* ---- ConstMap ---- */
+
+size_t fcm_constmap_serialized_size(const fcm_constmap_t *cm) {
+    return FCM_HEADER_SIZE + (size_t)cm->data_len * 8u + FCM_TRAILER_SIZE;
+}
+
+int fcm_constmap_write(const fcm_constmap_t *cm, void *buf) {
+    const fcm_format_t *fmt = fcm_format_for(fcm_constmap_formats, FCM_NFORMATS(fcm_constmap_formats), cm->hash);
+    if (!fmt) return FCM_E_INVALID_FORMAT;
+    uint8_t *start = (uint8_t *)buf;
+    uint8_t *p = fcm_write_header(start, fmt, cm->seed,
+                                  cm->segment_length, cm->segment_count,
+                                  cm->data_len, cm->n);
+    for (uint32_t i = 0; i < cm->data_len; i++) {
+        fcm_write_u64(p, cm->data[i]); p += 8;
+    }
+    fcm_write_u64(p, fcm_fnv1a64(start, (size_t)(p - start)));
+    return FCM_OK;
+}
+
+static void fcm_constmap_set_header(fcm_constmap_t *out, const fcm_header_t *h) {
+    out->seed                 = h->seed;
+    out->segment_length       = h->segment_length;
+    out->segment_length_mask  = h->segment_length ? h->segment_length - 1 : 0;
+    out->segment_count        = h->segment_count;
+    out->segment_count_length = h->segment_count * h->segment_length;
+    out->data_len             = h->data_len;
+    out->n                    = h->n;
+    out->hash                 = h->format->hash;
+}
+
+int fcm_constmap_read(fcm_constmap_t *out, const void *buf, size_t buf_len) {
+    if (!out) return FCM_E_INVALID_FORMAT;
+    memset(out, 0, sizeof(*out));
+    const uint8_t *p = (const uint8_t *)buf;
+    fcm_header_t h;
+    int rc = fcm_parse(p, buf_len, fcm_constmap_formats, FCM_NFORMATS(fcm_constmap_formats), 8, &h);
+    if (rc != FCM_OK) return rc;
+
+    uint64_t *data = NULL;
+    if (h.data_len > 0) {
+        data = (uint64_t *)malloc((size_t)h.data_len * sizeof(uint64_t));
+        if (!data) return FCM_E_NOMEM;
+        const uint8_t *dp = p + h.payload;
+        for (uint32_t i = 0; i < h.data_len; i++) {
+            data[i] = fcm_read_u64(dp + (size_t)i * 8);
+        }
+    }
+    fcm_constmap_set_header(out, &h);
+    out->data = data;
+    return FCM_OK;
+}
+
 int fcm_constmap_view(fcm_constmap_t *out, const void *buf, size_t buf_len) {
     if (!out) return FCM_E_INVALID_FORMAT;
     memset(out, 0, sizeof(*out));
     if (!fcm_host_is_little_endian()) return FCM_E_INVALID_FORMAT;
-    if (buf_len < FCM_HEADER_SIZE + FCM_TRAILER_SIZE) return FCM_E_SHORT_BUFFER;
-
     const uint8_t *p = (const uint8_t *)buf;
-    if (memcmp(p, fcm_magic_constmap, 8) != 0) return FCM_E_INVALID_FORMAT;
+    fcm_header_t h;
+    int rc = fcm_parse(p, buf_len, fcm_constmap_formats, FCM_NFORMATS(fcm_constmap_formats), 8, &h);
+    if (rc != FCM_OK) return rc;
 
-    uint32_t data_len = fcm_read_u32(p + 24);
-    size_t expected = FCM_HEADER_SIZE + (size_t)data_len * 8u + FCM_TRAILER_SIZE;
-    if (buf_len < expected) return FCM_E_SHORT_BUFFER;
-
-    uint64_t got_sum      = fcm_read_u64(p + expected - 8);
-    uint64_t expected_sum = fcm_fnv1a64(p, expected - 8);
-    if (got_sum != expected_sum) return FCM_E_CHECKSUM;
-
-    const uint8_t *dp = p + FCM_HEADER_SIZE;
+    const uint8_t *dp = p + h.payload;
     if (((uintptr_t)dp & 7u) != 0) return FCM_E_UNALIGNED;
 
-    uint32_t segment_length   = fcm_read_u32(p + 16);
-    out->seed                 = fcm_read_u64(p + 8);
-    out->segment_length       = segment_length;
-    out->segment_length_mask  = segment_length ? segment_length - 1 : 0;
-    out->segment_count        = fcm_read_u32(p + 20);
-    out->segment_count_length = out->segment_count * segment_length;
-    out->data_len             = data_len;
-    out->n                    = fcm_read_u32(p + 28);  /* original key count */
+    fcm_constmap_set_header(out, &h);
     /* Borrowed pointer into `buf`; the integer round-trip launders away the
      * source const-ness. Lookups only read this array. */
     out->data = (uint64_t *)(uintptr_t)dp;
+    return FCM_OK;
+}
+
+/* ---- VerifiedConstMap ---- */
+
+size_t fcm_verified_constmap_serialized_size(const fcm_verified_constmap_t *vm) {
+    return FCM_HEADER_SIZE + (size_t)vm->data_len * 16u + FCM_TRAILER_SIZE;
+}
+
+int fcm_verified_constmap_write(const fcm_verified_constmap_t *vm, void *buf) {
+    const fcm_format_t *fmt = fcm_format_for(fcm_verified_formats, FCM_NFORMATS(fcm_verified_formats), vm->hash);
+    if (!fmt) return FCM_E_INVALID_FORMAT;
+    uint8_t *start = (uint8_t *)buf;
+    uint8_t *p = fcm_write_header(start, fmt, vm->seed,
+                                  vm->segment_length, vm->segment_count,
+                                  vm->data_len, vm->n);
+    for (uint32_t i = 0; i < vm->data_len; i++) {
+        fcm_write_u64(p, vm->data[i]); p += 8;
+    }
+    for (uint32_t i = 0; i < vm->data_len; i++) {
+        fcm_write_u64(p, vm->checks[i]); p += 8;
+    }
+    fcm_write_u64(p, fcm_fnv1a64(start, (size_t)(p - start)));
+    return FCM_OK;
+}
+
+static void fcm_verified_set_header(fcm_verified_constmap_t *out, const fcm_header_t *h) {
+    out->seed                 = h->seed;
+    out->segment_length       = h->segment_length;
+    out->segment_length_mask  = h->segment_length ? h->segment_length - 1 : 0;
+    out->segment_count        = h->segment_count;
+    out->segment_count_length = h->segment_count * h->segment_length;
+    out->data_len             = h->data_len;
+    out->n                    = h->n;
+    out->hash                 = h->format->hash;
+}
+
+int fcm_verified_constmap_read(fcm_verified_constmap_t *out, const void *buf, size_t buf_len) {
+    if (!out) return FCM_E_INVALID_FORMAT;
+    memset(out, 0, sizeof(*out));
+    const uint8_t *p = (const uint8_t *)buf;
+    fcm_header_t h;
+    int rc = fcm_parse(p, buf_len, fcm_verified_formats, FCM_NFORMATS(fcm_verified_formats), 16, &h);
+    if (rc != FCM_OK) return rc;
+
+    uint64_t *data   = NULL;
+    uint64_t *checks = NULL;
+    if (h.data_len > 0) {
+        data   = (uint64_t *)malloc((size_t)h.data_len * sizeof(uint64_t));
+        checks = (uint64_t *)malloc((size_t)h.data_len * sizeof(uint64_t));
+        if (!data || !checks) { free(data); free(checks); return FCM_E_NOMEM; }
+        const uint8_t *dp = p + h.payload;
+        const uint8_t *cp = dp + (size_t)h.data_len * 8;
+        for (uint32_t i = 0; i < h.data_len; i++) {
+            data[i]   = fcm_read_u64(dp + (size_t)i * 8);
+            checks[i] = fcm_read_u64(cp + (size_t)i * 8);
+        }
+    }
+    fcm_verified_set_header(out, &h);
+    out->data   = data;
+    out->checks = checks;
     return FCM_OK;
 }
 
@@ -882,32 +1207,94 @@ int fcm_verified_constmap_view(fcm_verified_constmap_t *out, const void *buf, si
     if (!out) return FCM_E_INVALID_FORMAT;
     memset(out, 0, sizeof(*out));
     if (!fcm_host_is_little_endian()) return FCM_E_INVALID_FORMAT;
-    if (buf_len < FCM_HEADER_SIZE + FCM_TRAILER_SIZE) return FCM_E_SHORT_BUFFER;
-
     const uint8_t *p = (const uint8_t *)buf;
-    if (memcmp(p, fcm_magic_verified_constmap, 8) != 0) return FCM_E_INVALID_FORMAT;
+    fcm_header_t h;
+    int rc = fcm_parse(p, buf_len, fcm_verified_formats, FCM_NFORMATS(fcm_verified_formats), 16, &h);
+    if (rc != FCM_OK) return rc;
 
-    uint32_t data_len = fcm_read_u32(p + 24);
-    size_t expected = FCM_HEADER_SIZE + (size_t)data_len * 16u + FCM_TRAILER_SIZE;
-    if (buf_len < expected) return FCM_E_SHORT_BUFFER;
-
-    uint64_t got_sum      = fcm_read_u64(p + expected - 8);
-    uint64_t expected_sum = fcm_fnv1a64(p, expected - 8);
-    if (got_sum != expected_sum) return FCM_E_CHECKSUM;
-
-    const uint8_t *dp = p + FCM_HEADER_SIZE;
-    const uint8_t *cp = dp + (size_t)data_len * 8u;
+    const uint8_t *dp = p + h.payload;
+    const uint8_t *cp = dp + (size_t)h.data_len * 8u;
     if (((uintptr_t)dp & 7u) != 0) return FCM_E_UNALIGNED;
 
-    uint32_t segment_length   = fcm_read_u32(p + 16);
-    out->seed                 = fcm_read_u64(p + 8);
-    out->segment_length       = segment_length;
-    out->segment_length_mask  = segment_length ? segment_length - 1 : 0;
-    out->segment_count        = fcm_read_u32(p + 20);
-    out->segment_count_length = out->segment_count * segment_length;
-    out->data_len             = data_len;
-    out->n                    = fcm_read_u32(p + 28);  /* original key count */
+    fcm_verified_set_header(out, &h);
     out->data   = (uint64_t *)(uintptr_t)dp;
     out->checks = (uint64_t *)(uintptr_t)cp;
+    return FCM_OK;
+}
+
+/* ---- PairedVerifiedConstMap ---- */
+
+size_t fcm_paired_verified_constmap_serialized_size(const fcm_paired_verified_constmap_t *pm) {
+    return FCM_HEADER_SIZE + (size_t)pm->data_len * 16u + FCM_TRAILER_SIZE;
+}
+
+int fcm_paired_verified_constmap_write(const fcm_paired_verified_constmap_t *pm, void *buf) {
+    const fcm_format_t *fmt = fcm_format_for(fcm_paired_formats, FCM_NFORMATS(fcm_paired_formats), pm->hash);
+    if (!fmt) return FCM_E_INVALID_FORMAT;
+    uint8_t *start = (uint8_t *)buf;
+    uint8_t *p = fcm_write_header(start, fmt, pm->seed,
+                                  pm->segment_length, pm->segment_count,
+                                  pm->data_len, pm->n);
+    for (uint32_t i = 0; i < pm->data_len; i++) {
+        fcm_write_u64(p, pm->slots[i].value); p += 8;
+        fcm_write_u64(p, pm->slots[i].check); p += 8;
+    }
+    fcm_write_u64(p, fcm_fnv1a64(start, (size_t)(p - start)));
+    return FCM_OK;
+}
+
+static void fcm_paired_set_header(fcm_paired_verified_constmap_t *out, const fcm_header_t *h) {
+    out->seed                 = h->seed;
+    out->segment_length       = h->segment_length;
+    out->segment_length_mask  = h->segment_length ? h->segment_length - 1 : 0;
+    out->segment_count        = h->segment_count;
+    out->segment_count_length = h->segment_count * h->segment_length;
+    out->data_len             = h->data_len;
+    out->n                    = h->n;
+    out->hash                 = h->format->hash;
+}
+
+int fcm_paired_verified_constmap_read(fcm_paired_verified_constmap_t *out, const void *buf, size_t buf_len) {
+    if (!out) return FCM_E_INVALID_FORMAT;
+    memset(out, 0, sizeof(*out));
+    const uint8_t *p = (const uint8_t *)buf;
+    fcm_header_t h;
+    int rc = fcm_parse(p, buf_len, fcm_paired_formats, FCM_NFORMATS(fcm_paired_formats), 16, &h);
+    if (rc != FCM_OK) return rc;
+    if (!fcm_paired_params_ok(h.segment_length, h.segment_count, h.data_len)) return FCM_E_INVALID_PARAMS;
+
+    fcm_slot_t *slots = NULL;
+    if (h.data_len > 0) {
+        slots = (fcm_slot_t *)malloc((size_t)h.data_len * sizeof(fcm_slot_t));
+        if (!slots) return FCM_E_NOMEM;
+        const uint8_t *sp = p + h.payload;
+        for (uint32_t i = 0; i < h.data_len; i++) {
+            slots[i].value = fcm_read_u64(sp + (size_t)i * 16);
+            slots[i].check = fcm_read_u64(sp + (size_t)i * 16 + 8);
+        }
+    }
+    fcm_paired_set_header(out, &h);
+    out->slots = slots;
+    return FCM_OK;
+}
+
+int fcm_paired_verified_constmap_view(fcm_paired_verified_constmap_t *out, const void *buf, size_t buf_len) {
+    if (!out) return FCM_E_INVALID_FORMAT;
+    memset(out, 0, sizeof(*out));
+    if (!fcm_host_is_little_endian()) return FCM_E_INVALID_FORMAT;
+    const uint8_t *p = (const uint8_t *)buf;
+    fcm_header_t h;
+    int rc = fcm_parse(p, buf_len, fcm_paired_formats, FCM_NFORMATS(fcm_paired_formats), 16, &h);
+    if (rc != FCM_OK) return rc;
+    if (!fcm_paired_params_ok(h.segment_length, h.segment_count, h.data_len)) return FCM_E_INVALID_PARAMS;
+
+    /* 8-byte alignment is enough for correctness (the SIMD loads are
+     * unaligned loads); a 16-byte aligned buffer keeps each slot inside one
+     * cache line, which is the point of the layout. */
+    const uint8_t *sp = p + h.payload;
+    if (((uintptr_t)sp & 7u) != 0) return FCM_E_UNALIGNED;
+
+    fcm_paired_set_header(out, &h);
+    out->slots = (fcm_slot_t *)(uintptr_t)sp;
     return FCM_OK;
 }
