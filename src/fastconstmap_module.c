@@ -14,6 +14,35 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
+/* Free threading                                                            */
+/* ------------------------------------------------------------------------- */
+
+/* The maps are immutable once built, so lookups need no locking. What needs
+ * care on a free-threaded build is (1) the dict and lists we read, which
+ * another thread may be mutating, and (2) __init__, which installs the map.
+ * Critical sections only exist on 3.13+; with the GIL they are not needed. */
+#ifndef Py_BEGIN_CRITICAL_SECTION
+#define Py_BEGIN_CRITICAL_SECTION(op) {
+#define Py_END_CRITICAL_SECTION() }
+#endif
+
+/* Like PySequence_Fast, but on a free-threaded build a list (which another
+ * thread could mutate while we read its items) is snapshotted into a tuple.
+ * Any other iterable already becomes a fresh, private list. */
+static PyObject *fcm_sequence_fast(PyObject *obj, const char *msg) {
+#ifdef Py_GIL_DISABLED
+    if (PyList_Check(obj)) return PyList_AsTuple(obj);
+#endif
+    return PySequence_Fast(obj, msg);
+}
+
+static int fcm_already_initialized(const char *type_name) {
+    PyErr_Format(PyExc_TypeError,
+                 "%s is immutable: __init__ cannot be called again", type_name);
+    return -1;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Batched-lookup helpers                                                    */
 /* ------------------------------------------------------------------------- */
 
@@ -134,12 +163,17 @@ static int fcm_dict_to_arrays(PyObject *dict,
         PyErr_SetString(PyExc_TypeError, "expected a dict");
         return -1;
     }
-    Py_ssize_t n = PyDict_Size(dict);
-    if (n < 0) return -1;
-
     fcm_key_t *keys = NULL;
     uint64_t  *vals = NULL;
     PyObject  *keep = NULL;
+#ifdef Py_GIL_DISABLED
+    /* Iterate over a private copy: another thread may mutate `dict`. */
+    PyObject *copy = PyDict_Copy(dict);
+    if (!copy) return -1;
+    dict = copy;
+#endif
+    Py_ssize_t n = PyDict_Size(dict);
+    if (n < 0) goto fail;
 
     keep = PyTuple_New(n);
     if (!keep) goto fail;
@@ -205,12 +239,18 @@ static int fcm_dict_to_arrays(PyObject *dict,
     *out_keys   = keys;
     *out_values = vals;
     *out_keep   = keep;
+#ifdef Py_GIL_DISABLED
+    Py_DECREF(copy);
+#endif
     return 0;
 
 fail:
     PyMem_Free(keys);
     PyMem_Free(vals);
     Py_XDECREF(keep);
+#ifdef Py_GIL_DISABLED
+    Py_DECREF(copy);
+#endif
     return -1;
 }
 
@@ -224,6 +264,8 @@ typedef struct {
     /* When `view.obj` is non-NULL the map is a zero-copy view: `cm.data`
      * points into `view`'s buffer and must NOT be freed. */
     Py_buffer view;
+    /* Set once the map holds its data; it never changes afterwards. */
+    int initialized;
 } PyConstMap;
 
 /* Release whatever storage the map currently holds (owned heap data or a
@@ -251,11 +293,13 @@ static int PyConstMap_init(PyConstMap *self, PyObject *args, PyObject *kwargs) {
     PyObject  *keep = NULL;
     if (fcm_dict_to_arrays(dict, &n, &keys, &vals, &keep) < 0) return -1;
 
-    pyconstmap_release(self);
-
+    /* Build into a local map and install it only if the object holds none:
+     * replacing a map would free memory other threads may be reading. */
+    fcm_constmap_t built;
+    memset(&built, 0, sizeof(built));
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = fcm_constmap_new_with_hash(&self->cm, keys, vals, n, hash);
+    rc = fcm_constmap_new_with_hash(&built, keys, vals, n, hash);
     Py_END_ALLOW_THREADS
 
     PyMem_Free(keys);
@@ -263,6 +307,18 @@ static int PyConstMap_init(PyConstMap *self, PyObject *args, PyObject *kwargs) {
     Py_DECREF(keep);
 
     if (rc != FCM_OK) { fcm_set_python_error(rc); return -1; }
+    int installed = 0;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    if (!self->initialized) {
+        self->cm = built;
+        self->initialized = 1;
+        installed = 1;
+    }
+    Py_END_CRITICAL_SECTION();
+    if (!installed) {
+        fcm_constmap_free(&built);
+        return fcm_already_initialized("ConstMap");
+    }
     return 0;
 }
 
@@ -295,7 +351,7 @@ static PyObject *PyConstMap_get(PyConstMap *self, PyObject *arg) {
  * gain over a loop of single lookups comes from once the map no longer fits in
  * cache. */
 static PyObject *PyConstMap_get_many(PyConstMap *self, PyObject *arg) {
-    PyObject *seq = PySequence_Fast(arg, "get_many() requires an iterable of keys");
+    PyObject *seq = fcm_sequence_fast(arg, "get_many() requires an iterable of keys");
     if (!seq) return NULL;
     Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
     PyObject   **items = PySequence_Fast_ITEMS(seq);
@@ -332,7 +388,7 @@ static PyObject *PyConstMap_get_many_into(PyConstMap *self, PyObject *args) {
     PyObject *keys_arg, *out_arg;
     if (!PyArg_ParseTuple(args, "OO:get_many_into", &keys_arg, &out_arg)) return NULL;
 
-    PyObject *seq = PySequence_Fast(keys_arg, "get_many_into() requires an iterable of keys");
+    PyObject *seq = fcm_sequence_fast(keys_arg, "get_many_into() requires an iterable of keys");
     if (!seq) return NULL;
     Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
     PyObject   **items = PySequence_Fast_ITEMS(seq);
@@ -397,6 +453,7 @@ static PyObject *PyConstMap_deserialize(PyTypeObject *type, PyObject *arg) {
         fcm_set_python_error(rc);
         return NULL;
     }
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -446,6 +503,7 @@ static PyObject *PyConstMap_load(PyTypeObject *type, PyObject *arg) {
     int rc = fcm_constmap_read(&self->cm, buf, (size_t)len);
     PyMem_Free(buf);
     if (rc != FCM_OK) { Py_DECREF(self); fcm_set_python_error(rc); return NULL; }
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -497,6 +555,7 @@ static PyObject *PyConstMap_from_buffer(PyTypeObject *type, PyObject *arg) {
         return NULL;
     }
     self->view = view;  /* keep the buffer alive for the map's lifetime */
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -571,6 +630,8 @@ typedef struct {
     fcm_verified_constmap_t vm;
     /* Non-NULL view.obj => zero-copy view: data/checks point into the buffer. */
     Py_buffer view;
+    /* Set once the map holds its data; it never changes afterwards. */
+    int initialized;
 } PyVerifiedConstMap;
 
 static void pyverified_release(PyVerifiedConstMap *self) {
@@ -596,11 +657,13 @@ static int PyVerifiedConstMap_init(PyVerifiedConstMap *self, PyObject *args, PyO
     PyObject  *keep = NULL;
     if (fcm_dict_to_arrays(dict, &n, &keys, &vals, &keep) < 0) return -1;
 
-    pyverified_release(self);
-
+    /* Build into a local map and install it only if the object holds none:
+     * replacing a map would free memory other threads may be reading. */
+    fcm_verified_constmap_t built;
+    memset(&built, 0, sizeof(built));
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = fcm_verified_constmap_new_with_hash(&self->vm, keys, vals, n, hash);
+    rc = fcm_verified_constmap_new_with_hash(&built, keys, vals, n, hash);
     Py_END_ALLOW_THREADS
 
     PyMem_Free(keys);
@@ -608,6 +671,18 @@ static int PyVerifiedConstMap_init(PyVerifiedConstMap *self, PyObject *args, PyO
     Py_DECREF(keep);
 
     if (rc != FCM_OK) { fcm_set_python_error(rc); return -1; }
+    int installed = 0;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    if (!self->initialized) {
+        self->vm = built;
+        self->initialized = 1;
+        installed = 1;
+    }
+    Py_END_CRITICAL_SECTION();
+    if (!installed) {
+        fcm_verified_constmap_free(&built);
+        return fcm_already_initialized("VerifiedConstMap");
+    }
     return 0;
 }
 
@@ -680,7 +755,7 @@ static PyObject *PyVerifiedConstMap_get_many(PyVerifiedConstMap *self, PyObject 
     static char *kwlist[] = {"keys", "default", NULL};
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|O", kwlist, &arg, &default_)) return NULL;
 
-    PyObject *seq = PySequence_Fast(arg, "get_many() requires an iterable of keys");
+    PyObject *seq = fcm_sequence_fast(arg, "get_many() requires an iterable of keys");
     if (!seq) return NULL;
     Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
     PyObject   **items = PySequence_Fast_ITEMS(seq);
@@ -723,7 +798,7 @@ static PyObject *PyVerifiedConstMap_get_many_into(PyVerifiedConstMap *self, PyOb
     PyObject *keys_arg, *out_arg;
     if (!PyArg_ParseTuple(args, "OO:get_many_into", &keys_arg, &out_arg)) return NULL;
 
-    PyObject *seq = PySequence_Fast(keys_arg, "get_many_into() requires an iterable of keys");
+    PyObject *seq = fcm_sequence_fast(keys_arg, "get_many_into() requires an iterable of keys");
     if (!seq) return NULL;
     Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
     PyObject   **items = PySequence_Fast_ITEMS(seq);
@@ -778,6 +853,7 @@ static PyObject *PyVerifiedConstMap_deserialize(PyTypeObject *type, PyObject *ar
     int rc = fcm_verified_constmap_read(&self->vm, view.buf, (size_t)view.len);
     PyBuffer_Release(&view);
     if (rc != FCM_OK) { Py_DECREF(self); fcm_set_python_error(rc); return NULL; }
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -824,6 +900,7 @@ static PyObject *PyVerifiedConstMap_load(PyTypeObject *type, PyObject *arg) {
     int rc = fcm_verified_constmap_read(&self->vm, buf, (size_t)len);
     PyMem_Free(buf);
     if (rc != FCM_OK) { Py_DECREF(self); fcm_set_python_error(rc); return NULL; }
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -870,6 +947,7 @@ static PyObject *PyVerifiedConstMap_from_buffer(PyTypeObject *type, PyObject *ar
         return NULL;
     }
     self->view = view;
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -948,6 +1026,8 @@ typedef struct {
     fcm_paired_verified_constmap_t vm;
     /* Non-NULL view.obj => zero-copy view: slots point into the buffer. */
     Py_buffer view;
+    /* Set once the map holds its data; it never changes afterwards. */
+    int initialized;
 } PyPairedVerifiedConstMap;
 
 static void pypaired_release(PyPairedVerifiedConstMap *self) {
@@ -972,11 +1052,13 @@ static int PyPairedVerifiedConstMap_init(PyPairedVerifiedConstMap *self, PyObjec
     PyObject  *keep = NULL;
     if (fcm_dict_to_arrays(dict, &n, &keys, &vals, &keep) < 0) return -1;
 
-    pypaired_release(self);
-
+    /* Build into a local map and install it only if the object holds none:
+     * replacing a map would free memory other threads may be reading. */
+    fcm_paired_verified_constmap_t built;
+    memset(&built, 0, sizeof(built));
     int rc;
     Py_BEGIN_ALLOW_THREADS
-    rc = fcm_paired_verified_constmap_new_with_hash(&self->vm, keys, vals, n, hash);
+    rc = fcm_paired_verified_constmap_new_with_hash(&built, keys, vals, n, hash);
     Py_END_ALLOW_THREADS
 
     PyMem_Free(keys);
@@ -984,6 +1066,18 @@ static int PyPairedVerifiedConstMap_init(PyPairedVerifiedConstMap *self, PyObjec
     Py_DECREF(keep);
 
     if (rc != FCM_OK) { fcm_set_python_error(rc); return -1; }
+    int installed = 0;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    if (!self->initialized) {
+        self->vm = built;
+        self->initialized = 1;
+        installed = 1;
+    }
+    Py_END_CRITICAL_SECTION();
+    if (!installed) {
+        fcm_paired_verified_constmap_free(&built);
+        return fcm_already_initialized("PairedVerifiedConstMap");
+    }
     return 0;
 }
 
@@ -1056,7 +1150,7 @@ static PyObject *PyPairedVerifiedConstMap_get_many(PyPairedVerifiedConstMap *sel
     static char *kwlist[] = {"keys", "default", NULL};
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|O", kwlist, &arg, &default_)) return NULL;
 
-    PyObject *seq = PySequence_Fast(arg, "get_many() requires an iterable of keys");
+    PyObject *seq = fcm_sequence_fast(arg, "get_many() requires an iterable of keys");
     if (!seq) return NULL;
     Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
     PyObject   **items = PySequence_Fast_ITEMS(seq);
@@ -1099,7 +1193,7 @@ static PyObject *PyPairedVerifiedConstMap_get_many_into(PyPairedVerifiedConstMap
     PyObject *keys_arg, *out_arg;
     if (!PyArg_ParseTuple(args, "OO:get_many_into", &keys_arg, &out_arg)) return NULL;
 
-    PyObject *seq = PySequence_Fast(keys_arg, "get_many_into() requires an iterable of keys");
+    PyObject *seq = fcm_sequence_fast(keys_arg, "get_many_into() requires an iterable of keys");
     if (!seq) return NULL;
     Py_ssize_t   n     = PySequence_Fast_GET_SIZE(seq);
     PyObject   **items = PySequence_Fast_ITEMS(seq);
@@ -1154,6 +1248,7 @@ static PyObject *PyPairedVerifiedConstMap_deserialize(PyTypeObject *type, PyObje
     int rc = fcm_paired_verified_constmap_read(&self->vm, view.buf, (size_t)view.len);
     PyBuffer_Release(&view);
     if (rc != FCM_OK) { Py_DECREF(self); fcm_set_python_error(rc); return NULL; }
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -1200,6 +1295,7 @@ static PyObject *PyPairedVerifiedConstMap_load(PyTypeObject *type, PyObject *arg
     int rc = fcm_paired_verified_constmap_read(&self->vm, buf, (size_t)len);
     PyMem_Free(buf);
     if (rc != FCM_OK) { Py_DECREF(self); fcm_set_python_error(rc); return NULL; }
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -1246,6 +1342,7 @@ static PyObject *PyPairedVerifiedConstMap_from_buffer(PyTypeObject *type, PyObje
         return NULL;
     }
     self->view = view;
+    self->initialized = 1;
     return (PyObject *)self;
 }
 
@@ -1334,6 +1431,13 @@ PyMODINIT_FUNC PyInit__fastconstmap(void) {
 
     PyObject *m = PyModule_Create(&fastconstmap_module);
     if (!m) return NULL;
+#ifdef Py_GIL_DISABLED
+    /* Safe to run without the GIL (see "Free threading" above). */
+    if (PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED) < 0) {
+        Py_DECREF(m);
+        return NULL;
+    }
+#endif
 
     Py_INCREF(&PyConstMapType);
     if (PyModule_AddObject(m, "ConstMap", (PyObject *)&PyConstMapType) < 0) {

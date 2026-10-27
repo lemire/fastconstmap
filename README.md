@@ -279,7 +279,7 @@ Notes and constraints:
   use. Drop the map (`del cm`) before calling `shm.close()`.
 - The map is **immutable** — the intended pattern is *write once in the
   producer, then only read in every process*. Concurrent readers need no
-  locking.
+  locking (see [Threads](#threads-and-free-threaded-python)).
 - `from_buffer` verifies the magic bytes and the FNV-1a checksum, so a
   truncated or corrupt block raises `ValueError` rather than returning
   garbage.
@@ -294,6 +294,27 @@ Notes and constraints:
 `from_bytes()` remains available when you *want* an owned copy (or need to
 load on a big-endian host): it copies the data and the resulting map owns
 its memory independently of the source buffer.
+
+## Threads and free-threaded Python
+
+The maps are immutable, so any number of threads can look up keys in the
+same map at once, without locking. The extension supports free-threaded
+Python (3.13t, 3.14t): it does not re-enable the GIL on import, and lookups
+from several threads then run in parallel.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+m = ConstMap(d)
+with ThreadPoolExecutor(8) as pool:
+    results = list(pool.map(m.get_many, batches))
+```
+
+Building a map from a dict that another thread is modifying is safe (on a
+free-threaded build the map is built from a snapshot of the dict), and so is
+a batched lookup over a list that another thread is modifying. `__init__` can only be called once on a
+map; calling it again raises `TypeError` rather than replacing the data
+under other readers.
 
 ## Interoperability with the Go and Rust implementations
 
