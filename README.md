@@ -349,14 +349,21 @@ Two things to know about a map that came from Go or Rust:
 **Files from fastconstmap 0.9 and earlier** (`CMAP0002` / `VCMP0002`) still
 load and answer correctly: they were built with XXH3, and a map keeps the hash
 its file was built with (`m.hash` tells you which). Re-saving such a map keeps
-its legacy magic, since its table only answers to XXH3; Go and Rust name these
-files in their error message. To get a file the other implementations read,
+its legacy magic, since its table only answers to XXH3; Go, Rust and Java name
+these files in their error message. To get a file the other implementations read,
 rebuild the map from its keys.
 
 **Keeping XXH3.** XXH3 is faster than XXH64 on short keys, by about 1-2 ns per
 lookup at the C level. If you do not need the shared format, build with
 `ConstMap(d, hash="xxh3")` (likewise for the other two classes); such a map
 serializes with the legacy magic, readable by fastconstmap only.
+
+There is also a Java implementation, in [jbinfuse](https://github.com/FastFilter/jbinfuse)
+(`me.lemire.fastfilter:jbinfuse` on Maven Central, version 0.1.0 or later). It shares
+the same formats: for the same input it writes exactly the bytes Go and Rust write, and
+it reads this package's files (`CMAP0003`, and the key count in the other two formats is
+ignored). Its `wrap` queries a saved map in place, like `from_buffer`, but with no
+alignment requirement, so it opens Go and Rust `CMAP0001` files too.
 
 The interoperability is tested: `tests/interop/` holds files written by the Go
 package from a fixed input, which the test suite loads and checks, and the Go
