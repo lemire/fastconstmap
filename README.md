@@ -12,7 +12,7 @@ Given a `dict[str, int]` at build time, you get back a lookup object that:
 - uses **~9 bytes per key** (or ~18 with missing-key detection),
 - answers a lookup in **one xxhash call plus three array reads**,
 - is **immutable** and **serializable** to bytes / a file, in a format the
-  Go and Rust implementations read too,
+  Go, Rust and Java implementations read too,
 - exposes both a single-key API (`m[key]`) and a **batched** API
   (`m.get_many([...])`, `m.get_many_into([...], buf)`) that amortises Python-C
   call overhead and overlaps the memory accesses of a whole block of keys.
@@ -173,8 +173,8 @@ dominates instead.
 | | `PairedVerifiedConstMap` hot | 12.5 | **9.9** | 21% |
 
 These are with the default key hash, XXH64, which is what makes the files
-interchangeable with the Go and Rust implementations (see
-[Interoperability](#interoperability-with-the-go-and-rust-implementations)).
+interchangeable with the Go, Rust and Java implementations (see
+[Interoperability](#interoperability-with-the-go-rust-and-java-implementations)).
 XXH3, the hash of 0.9 and earlier, is about 1.3 ns faster per 20-byte key on
 the M4 Max and 2 ns on the Xeon; `ConstMap(d, hash="xxh3")` keeps it, at the
 price of files only fastconstmap can read.
@@ -316,19 +316,20 @@ a batched lookup over a list that another thread is modifying. `__init__` can on
 map; calling it again raises `TypeError` rather than replacing the data
 under other readers.
 
-## Interoperability with the Go and Rust implementations
+## Interoperability with the Go, Rust and Java implementations
 
 A map saved by any of [`constmap`][constmap] (Go), [`rsconstmap`][rsconstmap]
-(Rust) and fastconstmap loads in the other two, on a little-endian host (which
-is every mainstream one: x86-64, ARM64, RISC-V, Apple silicon). The three share
-the key hash (XXH64), the mixing, the seed sequence and the layout, so for the
-same input Go and Rust write byte-identical files, and fastconstmap writes the
-same bytes apart from one header word:
+(Rust), [`jbinfuse`][jbinfuse] (Java) and fastconstmap loads in the other three,
+on a little-endian host (which is every mainstream one: x86-64, ARM64, RISC-V,
+Apple silicon). The four share the key hash (XXH64), the mixing, the seed
+sequence and the layout, so for the same input Go, Rust and Java write
+byte-identical files, and fastconstmap writes the same bytes apart from one
+header word:
 
 | class | magic | notes |
 |---|---|---|
-| `ConstMap` | `CMAP0003` | Go and Rust write `CMAP0001`, the same format minus a 4-byte key count; all three read both |
-| `VerifiedConstMap` | `VMAP0001` | identical; the header word Go and Rust leave zero holds the key count here |
+| `ConstMap` | `CMAP0003` | Go, Rust and Java write `CMAP0001`, the same format minus a 4-byte key count; all four read both |
+| `VerifiedConstMap` | `VMAP0001` | identical; the header word Go, Rust and Java leave zero holds the key count here |
 | `PairedVerifiedConstMap` | `PMAP0001` | likewise |
 
 ```python
@@ -336,11 +337,11 @@ m = ConstMap.load("built-by-go.cmap")     # from constmap.SaveToFile / save_to_f
 vm = VerifiedConstMap.load("built-by-rust.vmap")
 ```
 
-Two things to know about a map that came from Go or Rust:
+Two things to know about a map that came from Go, Rust or Java:
 
 - **`len(m)` is 0**, because those writers do not record the key count. Every
   lookup is unaffected.
-- **A Go or Rust `ConstMap` file (`CMAP0001`) cannot be opened with
+- **A Go, Rust or Java `ConstMap` file (`CMAP0001`) cannot be opened with
   `from_buffer`**: its 28-byte header leaves the array 4 bytes off an 8-byte
   boundary in any aligned buffer, so `from_buffer` raises `ValueError`. `load`
   and `from_bytes`, which copy, work as usual. The other two formats have a
@@ -358,18 +359,16 @@ lookup at the C level. If you do not need the shared format, build with
 `ConstMap(d, hash="xxh3")` (likewise for the other two classes); such a map
 serializes with the legacy magic, readable by fastconstmap only.
 
-There is also a Java implementation, in [jbinfuse](https://github.com/FastFilter/jbinfuse)
-(`me.lemire.fastfilter:jbinfuse` on Maven Central, version 0.1.0 or later). It shares
-the same formats: for the same input it writes exactly the bytes Go and Rust write, and
-it reads this package's files (`CMAP0003`, and the key count in the other two formats is
-ignored). Its `wrap` queries a saved map in place, like `from_buffer`, but with no
-alignment requirement, so it opens Go and Rust `CMAP0001` files too.
+jbinfuse (`me.lemire.fastfilter:jbinfuse` on Maven Central, from version 0.1.0)
+has its own zero-copy views, `wrap`, which have no alignment requirement and so
+also open `CMAP0001` files in place.
 
 The interoperability is tested: `tests/interop/` holds files written by the Go
-package from a fixed input, which the test suite loads and checks, and the Go
-and Rust repositories hold files written by this package.
+package from a fixed input, which the test suite loads and checks, and the Go,
+Rust and Java repositories hold files written by this package.
 
 [rsconstmap]: https://github.com/lemire/rsconstmap
+[jbinfuse]: https://github.com/FastFilter/jbinfuse
 
 ## Benchmark
 
