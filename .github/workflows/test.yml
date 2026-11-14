@@ -30,3 +30,16 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v
+
+  pyodide:
+    # WebAssembly: 32-bit, no SIMD, no threads. cibuildwheel builds the
+    # wheels and runs the tests in Node.
+    name: Pyodide (WebAssembly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        uses: pypa/cibuildwheel@v4.3.5
+        env:
+          CIBW_PLATFORM: pyodide

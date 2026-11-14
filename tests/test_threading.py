@@ -9,6 +9,9 @@ import pytest
 
 from fastconstmap import NOT_FOUND, ConstMap, PairedVerifiedConstMap, VerifiedConstMap
 
+# Python cannot start threads under Pyodide (WebAssembly).
+needs_threads = pytest.mark.skipif(sys.platform == "emscripten", reason="no threads under Pyodide")
+
 N_THREADS = 8
 TYPES = [ConstMap, VerifiedConstMap, PairedVerifiedConstMap]
 
@@ -44,6 +47,7 @@ def test_gil_stays_disabled():
     assert not sys._is_gil_enabled()
 
 
+@needs_threads
 @pytest.mark.parametrize("cls", TYPES)
 def test_concurrent_lookups(cls):
     data = make_data()
@@ -63,6 +67,7 @@ def test_concurrent_lookups(cls):
     run_threads(work)
 
 
+@needs_threads
 @pytest.mark.parametrize("cls", [VerifiedConstMap, PairedVerifiedConstMap])
 def test_concurrent_absent_keys(cls):
     m = cls(make_data())
@@ -77,6 +82,7 @@ def test_concurrent_absent_keys(cls):
     run_threads(work)
 
 
+@needs_threads
 @pytest.mark.parametrize("cls", TYPES)
 def test_concurrent_construction(cls):
     data = make_data(5_000)
@@ -91,6 +97,7 @@ def test_concurrent_construction(cls):
     run_threads(work)
 
 
+@needs_threads
 @pytest.mark.parametrize("cls", TYPES)
 def test_lookup_while_list_mutates(cls):
     # A key list shared with a thread that mutates it must not crash the
@@ -116,6 +123,7 @@ def test_lookup_while_list_mutates(cls):
         t.join()
 
 
+@needs_threads
 @pytest.mark.parametrize("cls", TYPES)
 def test_construct_while_dict_mutates(cls):
     data = make_data(2_000)
